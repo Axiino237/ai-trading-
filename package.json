@@ -1,0 +1,27 @@
+{
+  "name": "stocksbackend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@supabase/supabase-js": "^2.105.4",
+    "axios-retry": "^4.5.0",
+    "body-parser": "^2.2.2",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.9.0",
+    "pg": "^8.20.0",
+    "smartapi-javascript": "^1.0.27",
+    "socket.io": "^4.8.3",
+    "totp-generator": "^2.0.1"
+  }
+}
