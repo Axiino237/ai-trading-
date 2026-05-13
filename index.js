@@ -201,6 +201,31 @@ app.get('/logs', async (req, res) => {
     }
 });
 
+app.post('/analyze', async (req, res) => {
+    const { symbol } = req.body;
+    try {
+        // Mock AI Insight generation based on symbol hash for deterministic results
+        const hash = symbol.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+        const sentiment = hash % 2 === 0 ? 'BUY' : 'SELL';
+        const confidenceScore = 65 + (hash % 30); // 65% to 95%
+        
+        const explanation = sentiment === 'BUY' 
+            ? `AI detects strong accumulation in ${symbol} with key moving averages crossing bullish. Volume profile supports upward continuation.`
+            : `AI detects overhead resistance and bearish divergence for ${symbol}. Momentum oscillators indicate overbought conditions.`;
+
+        // Simulate network delay for AI processing feel
+        await new Promise(r => setTimeout(r, 800));
+
+        res.json({
+            sentiment,
+            confidenceScore,
+            explanation
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/trade/manual', async (req, res) => {
     const { symbol, side, price } = req.body;
     try {
@@ -218,15 +243,19 @@ app.post('/trade/manual', async (req, res) => {
         const settings = await supabaseService.getUserSettings(userId);
         const mode = settings.trade_mode || 'PAPER';
 
-        // Dynamic Quantity for Manual Trade
-        const quantity = await scannerService.calculateQuantity(userId, price, sl, mode);
+        // Use user-provided quantity or fallback to dynamic calculation
+        let finalQuantity = req.body.quantity ? parseInt(req.body.quantity, 10) : 0;
+        
+        if (!finalQuantity || finalQuantity <= 0) {
+            finalQuantity = await scannerService.calculateQuantity(userId, price, sl, mode);
+        }
 
-        if (quantity <= 0) {
-            return res.status(400).json({ error: 'Insufficient funds for 1 share' });
+        if (finalQuantity <= 0) {
+            return res.status(400).json({ error: 'Insufficient funds or invalid quantity' });
         }
 
         if (mode === 'REAL') {
-            await angelOneService.placeOrder(symbol, scrip.token, quantity, side, 'LIMIT', price);
+            await angelOneService.placeOrder(symbol, scrip.token, finalQuantity, side, 'LIMIT', price);
         }
 
         await supabaseService.saveTrade({
@@ -236,7 +265,7 @@ app.post('/trade/manual', async (req, res) => {
             entry_price: price,
             stop_loss: sl,
             take_profit: tp,
-            quantity: quantity,
+            quantity: finalQuantity,
             side: side,
             type: side,
             status: 'OPEN',
