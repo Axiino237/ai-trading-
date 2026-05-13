@@ -276,6 +276,28 @@ class SupabaseService {
             return [];
         }
     }
+
+    /**
+     * Delete logs older than 5 days to save storage
+     */
+    async cleanupOldLogs() {
+        try {
+            const fiveDaysAgo = new Date();
+            fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+            
+            const { error, count } = await supabase
+                .from('system_logs')
+                .delete({ count: 'exact' })
+                .lt('created_at', fiveDaysAgo.toISOString());
+
+            if (error) throw error;
+            if (count > 0) {
+                console.log(`[DB MAINTENANCE] Automatically deleted ${count} old system logs (older than 5 days). 🧹`);
+            }
+        } catch (e) {
+            console.error('[DB MAINTENANCE ERROR] Failed to clean up old logs:', e.message);
+        }
+    }
 }
 
 module.exports = new SupabaseService();

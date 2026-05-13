@@ -261,6 +261,15 @@ server.listen(PORT, '0.0.0.0', async () => {
     try {
         await angelOneService.login();
         scannerService.start();
+        
+        // Initial DB Maintenance: Cleanup old logs
+        await supabaseService.cleanupOldLogs();
+        
+        // Schedule DB Maintenance: Every 24 hours
+        setInterval(async () => {
+            await supabaseService.cleanupOldLogs();
+        }, 24 * 60 * 60 * 1000);
+
     } catch (error) {
         console.error('Initial Login Error:', error.message);
     }
