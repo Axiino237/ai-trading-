@@ -396,9 +396,10 @@ class ScannerService {
 
                         // 3. Credit back to Wallet (Paper mode only)
                         if (trade.trading_type === 'PAPER') {
-                            const originalCost = trade.entry_price * (trade.quantity || 1);
+                            const qty = trade.quantity || 1;
+                            const originalCost = trade.entry_price * qty;
                             const isBuy = trade.type === 'BUY';
-                            const pnl = isBuy ? (ltp - trade.entry_price) : (trade.entry_price - ltp);
+                            const pnl = isBuy ? (ltp - trade.entry_price) * qty : (trade.entry_price - ltp) * qty;
                             const creditAmount = originalCost + pnl;
                             await supabaseService.creditPaperFunds(trade.user_id, creditAmount);
                             logger.info(`[MONITOR] Credited ₹${creditAmount.toFixed(2)} to paper wallet for ${trade.symbol}`);
@@ -408,7 +409,8 @@ class ScannerService {
                         if (global.io) global.io.emit('trade-executed', { symbol: trade.symbol, mode: 'EXIT', reason: exitReason });
                         
                         const telegramService = require('./telegramService');
-                        const pnlVal = trade.type === 'BUY' ? (ltp - trade.entry_price) : (trade.entry_price - ltp);
+                        const qty = trade.quantity || 1;
+                        const pnlVal = trade.type === 'BUY' ? (ltp - trade.entry_price) * qty : (trade.entry_price - ltp) * qty;
                         await telegramService.sendTradeAlert({
                             symbol: trade.symbol,
                             side: trade.type,
