@@ -74,6 +74,20 @@ class TechnicalAnalysis {
         return (pc < po) && (cc > co) && (cc > po) && (co < pc);
     }
 
+    isBearishEngulfing(prev, curr) {
+        const [pt, po, ph, pl, pc, pv] = prev;
+        const [ct, co, ch, cl, cc, cv] = curr;
+        return (pc > po) && (cc < co) && (cc < po) && (co > pc);
+    }
+
+    isInvertedHammer(candle) {
+        const [t, o, h, l, c, v] = candle;
+        const body = Math.abs(c - o);
+        const upperShadow = h - Math.max(o, c);
+        const lowerShadow = Math.min(o, c) - l;
+        return upperShadow >= 2 * body && lowerShadow <= 0.1 * upperShadow;
+    }
+
     /**
      * Support / Resistance detection (Simple Swing method)
      */
@@ -94,24 +108,51 @@ class TechnicalAnalysis {
     }
 
     /**
-     * Final Rule Check
+     * Final Rule Check - Dual Mode
      */
-    checkRules(data) {
+    checkRules(data, mode = 'STRICT') {
         const { ema9, ema20, ema50, rsi, macd, volume, avgVolume, candles } = data;
-        
-        const trendBullish = ema9 > ema20 && ema20 > ema50;
-        const macdBullish = macd.histogram > 0;
-        const rsiValid = rsi > 45 && rsi < 70;
-        const volumeBreakout = volume > 1.5 * avgVolume;
         
         const lastCandle = candles[candles.length - 1];
         const prevCandle = candles[candles.length - 2];
-        const patternConfirmed = this.isHammer(lastCandle) || this.isBullishEngulfing(prevCandle, lastCandle);
+        
+        const bullishPattern = this.isHammer(lastCandle) || this.isBullishEngulfing(prevCandle, lastCandle);
+        const bearishPattern = this.isInvertedHammer(lastCandle) || this.isBearishEngulfing(prevCandle, lastCandle);
 
-        return {
-            pass: trendBullish && macdBullish && rsiValid && volumeBreakout && patternConfirmed,
-            details: { trendBullish, macdBullish, rsiValid, volumeBreakout, patternConfirmed }
-        };
+        if (mode === 'STRICT') {
+            // Bullish Check
+            const trendBullish = ema9 > ema20 && ema20 > ema50;
+            const rsiBullish = rsi > 50 && rsi < 70;
+            const volBullish = volume > 1.5 * avgVolume;
+            const isBuy = trendBullish && rsiBullish && volBullish && bullishPattern;
+
+            // Bearish Check
+            const trendBearish = ema9 < ema20 && ema20 < ema50;
+            const rsiBearish = rsi < 50 && rsi > 30;
+            const volBearish = volume > 1.5 * avgVolume;
+            const isSell = trendBearish && rsiBearish && volBearish && bearishPattern;
+
+            return {
+                pass: isBuy || isSell,
+                side: isBuy ? 'BUY' : (isSell ? 'SELL' : 'NONE'),
+                details: { isBuy, isSell }
+            };
+        } else {
+            // RELAXED MODE
+            const trendUp = ema9 > ema20;
+            const trendDown = ema9 < ema20;
+            const volOk = volume > 1.1 * avgVolume;
+            const rsiOk = rsi > 40 && rsi < 75;
+
+            const isBuy = (trendUp && rsiOk && volOk) || (trendUp && bullishPattern);
+            const isSell = (trendDown && rsiOk && volOk) || (trendDown && bearishPattern);
+
+            return {
+                pass: isBuy || isSell,
+                side: isBuy ? 'BUY' : (isSell ? 'SELL' : 'NONE'),
+                details: { isBuy, isSell }
+            };
+        }
     }
 }
 

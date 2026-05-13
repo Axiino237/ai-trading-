@@ -15,22 +15,42 @@ class SupabaseService {
      */
     async saveTrade(tradeData) {
         try {
+            // 1. Mandatory Pre-Flight Check: Deduct from Paper Funds if mode is PAPER
+            // We MUST do this BEFORE inserting into the DB to prevent ghost trades when wallet is empty.
+            if (tradeData.trading_type === 'PAPER') {
+                const totalCost = (tradeData.entry_price || 0) * (tradeData.quantity || 1);
+                const currentBalance = await this.getPaperFunds(tradeData.user_id);
+                
+                if (currentBalance < totalCost) {
+                    throw new Error(`Insufficient Paper Funds! Need ₹${totalCost.toFixed(2)}, Have ₹${currentBalance.toFixed(2)}`);
+                }
+            }
+
+            // 2. Insert the trade into the database
             const { data, error } = await supabase
                 .from('trades')
                 .insert([{
-                    user_id: tradeData.user_id || '00000000-0000-0000-0000-000000000000',
+                    user_id: tradeData.user_id,
                     symbol: tradeData.symbol,
                     type: tradeData.type, // 'BUY' or 'SELL'
                     side: `${tradeData.type === 'BUY' ? 'LONG' : 'SHORT'}_${tradeData.trading_type || 'PAPER'}`,
                     entry_price: tradeData.entry_price,
                     stop_loss: tradeData.stop_loss,
                     take_profit: tradeData.take_profit,
+                    quantity: tradeData.quantity || 1,
                     trade_mode: tradeData.trade_mode || 'BOT', // 'BOT' or 'MANUAL'
                     status: 'OPEN',
                     created_at: new Date().toISOString()
                 }]);
 
             if (error) throw error;
+
+            // 3. Actually deduct the funds now that DB insert is successful
+            if (tradeData.trading_type === 'PAPER') {
+                const totalCost = (tradeData.entry_price || 0) * (tradeData.quantity || 1);
+                await this.deductPaperFunds(tradeData.user_id, totalCost);
+            }
+
             return { success: true, data };
         } catch (error) {
             console.error('Supabase Save Error:', error.message);
@@ -99,51 +119,66 @@ class SupabaseService {
      */
     async getPaperFunds(userId) {
         try {
-            const { data, error } = await supabase
+            const { data } = await supabase
                 .from('paper_funds')
                 .select('balance')
                 .eq('user_id', userId)
                 .single();
+            return data ? data.balance : 100000;
+        } catch (e) { return 100000; }
+    }
 
-            if (error) return 100000.00;
-            return data.balance;
-        } catch (error) {
-            return 100000.00;
+    async deductPaperFunds(userId, amount) {
+        try {
+            const current = await this.getPaperFunds(userId);
+            const newBalance = current - amount;
+            await supabase
+                .from('paper_funds')
+                .upsert({ user_id: userId, balance: newBalance }, { onConflict: 'user_id' });
+            return newBalance;
+        } catch (e) {
+            console.error('Wallet deduction failed:', e.message);
         }
     }
+
+    async creditPaperFunds(userId, amount) {
+        try {
+            const current = await this.getPaperFunds(userId);
+            const newBalance = current + amount;
+            await supabase
+                .from('paper_funds')
+                .upsert({ user_id: userId, balance: newBalance }, { onConflict: 'user_id' });
+            return newBalance;
+        } catch (e) {
+            console.error('Wallet credit failed:', e.message);
+        }
+    }
+
     /**
      * Get user settings (Mapped to UI expectations)
      */
     async getUserSettings(userId) {
         try {
-            const { data, error } = await supabase
+            const { data } = await supabase
                 .from('auto_settings')
                 .select('*')
                 .eq('user_id', userId)
                 .single();
+
+            console.log(`[DEBUG] DB Data:`, data ? 'Found' : 'Missing');
             
-            let localMode = 'PAPER';
-            try {
-                const fs = require('fs');
-                if (fs.existsSync('./local_settings.json')) {
-                    const local = JSON.parse(fs.readFileSync('./local_settings.json', 'utf8'));
-                    localMode = local[userId]?.trade_mode || 'PAPER';
-                }
-            } catch (e) {}
-
-            if (error || !data) {
-                return { user_id: userId, daily_trade_limit: 5, auto_trade_on: false, trade_mode: localMode };
-            }
-
-            // Map DB columns to UI fields
-            return {
-                user_id: data.user_id,
-                daily_trade_limit: data.max_trades_per_day || 5,
-                auto_trade_on: data.is_auto_active || false,
-                trade_mode: localMode
+            const finalSettings = {
+                user_id: data ? data.user_id : userId,
+                daily_trade_limit: data ? (data.max_trades_per_day || 5) : 5,
+                auto_trade_on: data ? (data.is_auto_active || false) : false,
+                trade_mode: data ? (data.trade_mode || 'PAPER') : 'PAPER',
+                scan_mode: data ? (data.scan_mode || 'STRICT') : 'STRICT',
+                risk_per_trade: data ? (data.risk_per_trade || 1) : 1
             };
+            console.log(`[SETTINGS] Loaded:`, JSON.stringify(finalSettings));
+            return finalSettings;
         } catch (error) {
-            return { user_id: userId, daily_trade_limit: 5, auto_trade_on: false, trade_mode: 'PAPER' };
+            return { user_id: userId, daily_trade_limit: 5, auto_trade_on: false, trade_mode: 'PAPER', scan_mode: 'STRICT' };
         }
     }
 
@@ -166,19 +201,8 @@ class SupabaseService {
 
     async updateSettings(userId, updates) {
         try {
-            // Save trade_mode to local file as fallback
-            if (updates.trade_mode) {
-                try {
-                    const fs = require('fs');
-                    let local = {};
-                    if (fs.existsSync('./local_settings.json')) {
-                        local = JSON.parse(fs.readFileSync('./local_settings.json', 'utf8'));
-                    }
-                    local[userId] = { ...local[userId], trade_mode: updates.trade_mode };
-                    fs.writeFileSync('./local_settings.json', JSON.stringify(local, null, 2));
-                } catch (e) {}
-            }
-
+            console.log(`[SETTINGS UPDATE] Incoming for ${userId}:`, JSON.stringify(updates));
+            
             // 1. Fetch current settings to avoid overwriting with undefined
             const { data: current } = await supabase
                 .from('auto_settings')
@@ -186,23 +210,70 @@ class SupabaseService {
                 .eq('user_id', userId)
                 .single();
 
-            // 2. Merge incoming updates with existing values
-            // Note: trade_mode is omitted because the column does not exist in the database schema.
+            // 2. Map UI fields back to DB columns
+            const autoActive = updates.auto_trade_on !== undefined ? updates.auto_trade_on : updates.is_auto_active;
+            const dailyLimit = updates.daily_trade_limit !== undefined ? updates.daily_trade_limit : updates.max_trades_per_day;
+            const tradeMode = updates.trade_mode || (current ? current.trade_mode : 'PAPER');
+
             const dbSettings = {
                 user_id: userId,
-                is_auto_active: updates.auto_trade_on !== undefined ? updates.auto_trade_on : (current ? current.is_auto_active : false),
-                max_trades_per_day: updates.daily_trade_limit !== undefined ? updates.daily_trade_limit : (current ? current.max_trades_per_day : 5)
+                is_auto_active: autoActive !== undefined ? autoActive : (current ? current.is_auto_active : false),
+                max_trades_per_day: dailyLimit !== undefined ? parseInt(dailyLimit) : (current ? current.max_trades_per_day : 5),
+                scan_mode: updates.scan_mode || (current ? current.scan_mode : 'STRICT'),
+                risk_per_trade: updates.risk_per_trade !== undefined ? updates.risk_per_trade : (current ? current.risk_per_trade : 1),
+                trade_mode: tradeMode
             };
+
+            console.log(`[SETTINGS] Upserting to DB:`, JSON.stringify(dbSettings));
 
             const { error } = await supabase
                 .from('auto_settings')
                 .upsert(dbSettings, { onConflict: 'user_id' });
             
-            if (error) throw error;
+            if (error) {
+                // If it fails because column doesn't exist, we might need to inform user
+                if (error.message.includes('column "trade_mode" does not exist')) {
+                    console.error('[SETTINGS] ERROR: trade_mode column is MISSING in Supabase table "auto_settings"');
+                    throw new Error('Database column "trade_mode" missing. Please add it via SQL: ALTER TABLE auto_settings ADD COLUMN trade_mode TEXT DEFAULT \'PAPER\';');
+                }
+                throw error;
+            }
+
+            console.log(`[SETTINGS] DB Sync Successful for ${userId} ✅`);
             return { success: true };
         } catch (error) {
-            console.error('Update Settings Error:', error.message);
-            return { success: false, error: error.message };
+            console.error('[SETTINGS] Update Error:', error.message);
+            throw error;
+        }
+    }
+    /**
+     * Save System Activity Log
+     */
+    async saveLog(level, symbol, message, data) {
+        try {
+            await supabase.from('system_logs').insert([{
+                level, symbol, message, data,
+                created_at: new Date().toISOString()
+            }]);
+        } catch (e) {}
+    }
+
+    /**
+     * Get Logs with Pagination (Lazy Loading)
+     */
+    async getLogs(limit = 20, offset = 0) {
+        try {
+            const { data, error } = await supabase
+                .from('system_logs')
+                .select('*')
+                .order('created_at', { ascending: false })
+                .range(offset, offset + limit - 1);
+            
+            if (error) throw error;
+            return data;
+        } catch (error) {
+            console.error('Fetch Logs Error:', error.message);
+            return [];
         }
     }
 }

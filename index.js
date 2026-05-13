@@ -1,178 +1,70 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
 const http = require('http');
 const { Server } = require('socket.io');
-// Gemini Service (Rotating Keys)
+const cors = require('cors');
+const bodyParser = require('body-parser');
+require('dotenv').config();
+
+const angelOneService = require('./angelOneService');
 const geminiService = require('./geminiService');
+const scannerService = require('./scannerService');
+const supabaseService = require('./supabaseService');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
+    cors: { origin: "*", methods: ["GET", "POST"] }
 });
-
-const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(bodyParser.json());
 
-const angelOneService = require('./angelOneService');
-const supabaseService = require('./supabaseService');
-const ta = require('./technicalAnalysis');
-const scannerService = require('./scannerService');
-
-// Make IO accessible to other services
+// Expose io to services
 global.io = io;
 
-app.get('/', (req, res) => {
-    res.send('Stocks Hybrid AI Backend is Running with WebSockets! 🚀');
-});
+// Helper to get the primary user (First one in DB)
+async function getSystemUser() {
+    // 1. Try to get auto-active user first
+    const activeUsers = await supabaseService.getAutoEnabledUsers();
+    if (activeUsers.length > 0) return activeUsers[0].user_id;
 
-/**
- * Socket.io Connection
- */
-io.on('connection', (socket) => {
-    console.log('Client connected to real-time updates ⚡');
+    // 2. Fallback: Get ANY user from auto_settings if none are active
+    const { data } = await supabaseService.supabase.from('auto_settings').select('user_id').limit(1);
+    return (data && data.length > 0) ? data[0].user_id : null;
+}
 
-    socket.on('disconnect', () => {
-        console.log('Client disconnected');
-    });
-});
+// ────────────────────────────────────────────────────────────────
+// ROUTES
+// ────────────────────────────────────────────────────────────────
 
-/**
- * Login to Angel One
- */
-app.post('/angel/login', async (req, res) => {
-    const { clientId, password, totpSecret } = req.body;
-    const result = await angelOneService.login(clientId, password, totpSecret);
-    res.json(result);
-});
+app.get('/', (req, res) => res.send('StocksPro Backend Live 🚀'));
 
-app.post('/angel/auto-login', async (req, res) => {
-    const result = await angelOneService.login();
-    res.json(result);
-});
-
-app.get('/angel/quote/:symbol', async (req, res) => {
-    const { symbol } = req.params;
-    const { exchange } = req.query;
-    try {
-        const data = await angelOneService.getQuote(symbol, exchange || 'NSE');
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/analyze', async (req, res) => {
-    const { symbol, autoTrade = false, user_id } = req.body;
-    if (!symbol) return res.status(400).json({ error: 'Missing symbol' });
-
-    try {
-        const quote = await angelOneService.getQuote(symbol);
-        const candles = await angelOneService.getCandleData(symbol, 'FIVE_MINUTE', 2);
-        const rsi = ta.calculateRSI(candles);
-        const ema20 = ta.calculateEMA(candles, 20);
-        const ema50 = ta.calculateEMA(candles, 50);
-        const trend = ta.getTrend(ema20, ema50);
-        
-        const prompt = `
-            You are a Professional Quant Trader.
-            SYMBOL: ${symbol}, Price: ${quote.lastTradedPrice}, RSI: ${rsi.toFixed(2)}, Trend: ${trend}
-            TASK: Final Sentiment (BULLISH/BEARISH/NEUTRAL) in Tanglish.
-            OUTPUT FORMAT (JSON): {"sentiment": "BULLISH", "confidence": 85, "explanation": "...", "suggested_entry": 100, "suggested_sl": 95, "suggested_tp": 110}
-        `;
-
-        const text = await geminiService.generateAnalysis(prompt);
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error('AI analysis returned invalid format');
-        const analysis = JSON.parse(jsonMatch[0]);
-        
-        if (autoTrade && analysis.confidence >= 75 && analysis.sentiment !== 'NEUTRAL') {
-            await supabaseService.saveTrade({
-                user_id,
-                symbol,
-                symbolToken: quote.symbolToken,
-                type: analysis.sentiment === 'BULLISH' ? 'BUY' : 'SELL',
-                entry_price: analysis.suggested_entry || quote.lastTradedPrice,
-                stop_loss: analysis.suggested_sl,
-                take_profit: analysis.suggested_tp
-            });
-            // Broadcast trade event
-            io.emit('trade-executed', { symbol, type: analysis.sentiment });
-        }
-
-        res.json({ ...analysis, indicators: { rsi, trend, ema20, ema50 }, symbol });
-    } catch (error) {
-        res.status(500).json({ sentiment: 'NEUTRAL', explanation: error.message });
-    }
-});
-
-/**
- * Manual Trade Execution
- */
-app.post('/trade/manual', async (req, res) => {
-    const { symbol, type, user_id, price } = req.body;
-    if (!symbol || !type) return res.status(400).json({ error: 'Missing required fields' });
-
-    try {
-        const quote = await angelOneService.getQuote(symbol);
-        const entryPrice = price || quote.lastTradedPrice;
-        
-        // Place order via Angel One
-        const order = await angelOneService.placeOrder(
-            symbol, 
-            quote.symbolToken, 
-            1, 
-            type, 
-            'LIMIT', 
-            entryPrice
-        );
-
-        const settings = await supabaseService.getUserSettings(MOCK_USER_ID);
-        
-        // Save to DB as MANUAL with correct trading_type
-        await supabaseService.saveTrade({
-            user_id: user_id || MOCK_USER_ID,
-            symbol,
-            type,
-            entry_price: entryPrice,
-            trade_mode: 'MANUAL',
-            trading_type: settings.trade_mode || 'PAPER'
-        });
-
-        io.emit('trade-executed', { symbol, type, price: entryPrice, mode: 'MANUAL' });
-        res.json({ success: true, order });
-    } catch (error) {
-        console.error('Manual Trade Error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.get('/search', async (req, res) => {
+app.get('/market/search', async (req, res) => {
     const { query } = req.query;
-    if (!query || query.length < 2) return res.json([]);
     try {
-        console.log(`[SEARCH] Query: ${query}`);
-        const result = await angelOneService.searchScrip('NSE', query.toUpperCase());
-        console.log(`[SEARCH] Results found: ${result.data.length}`);
+        const result = await angelOneService.searchScrip('NSE', query);
         res.json(result.data || []);
     } catch (error) {
-        console.error('[SEARCH] Error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-const MOCK_USER_ID = '00000000-0000-0000-0000-000000000000';
+// Alias for frontend compatibility
+app.get('/search', async (req, res) => {
+    const { query } = req.query;
+    try {
+        const result = await angelOneService.searchScrip('NSE', query);
+        res.json(result.data || []);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 app.get('/watchlist', async (req, res) => {
     try {
-        const list = await supabaseService.getUserWatchlist(MOCK_USER_ID);
+        const userId = await getSystemUser();
+        if (!userId) return res.json([]);
+        const list = await supabaseService.getUserWatchlist(userId);
         res.json(list);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -181,72 +73,200 @@ app.get('/watchlist', async (req, res) => {
 
 app.post('/watchlist', async (req, res) => {
     const { symbol } = req.body;
-    console.log(`[WATCHLIST] Attempting to add symbol: ${symbol}`);
     try {
-        const { data, error } = await supabaseService.supabase
-            .from('watchlist')
-            .upsert({ user_id: MOCK_USER_ID, symbol: symbol.toUpperCase() });
-        
-        if (error) {
-            console.error('[WATCHLIST] DB Error:', error.message);
-            throw error;
-        }
-        console.log(`[WATCHLIST] Successfully added: ${symbol}`);
+        const userId = await getSystemUser();
+        if (!userId) throw new Error('No user found in DB');
+        await supabaseService.addToWatchlist(userId, symbol.toUpperCase());
         res.json({ success: true });
     } catch (error) {
-        console.error('[WATCHLIST] Catch Error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.delete('/watchlist/:symbol', async (req, res) => {
-    const { symbol } = req.params;
     try {
-        const { error } = await supabaseService.supabase
-            .from('watchlist')
-            .delete()
-            .eq('user_id', MOCK_USER_ID)
-            .eq('symbol', symbol.toUpperCase());
-        if (error) throw error;
+        const userId = await getSystemUser();
+        if (!userId) throw new Error('No user found in DB');
+        await supabaseService.removeFromWatchlist(userId, req.params.symbol.toUpperCase());
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/history', async (req, res) => {
-    const settings = await supabaseService.getUserSettings(MOCK_USER_ID);
-    const history = await supabaseService.getHistory(settings.trade_mode || 'PAPER');
-    res.json(history);
-});
-
-app.get('/settings', async (req, res) => {
-    const userId = req.query.user_id || MOCK_USER_ID;
-    const settings = await supabaseService.getUserSettings(userId);
-    res.json(settings);
-});
-
-app.post('/settings', async (req, res) => {
-    const { user_id, ...settings } = req.body;
-    const result = await supabaseService.updateSettings(user_id || MOCK_USER_ID, settings);
-    res.json(result);
-});
-
-app.get('/balances', async (req, res) => {
+app.get('/trades', async (req, res) => {
     try {
-        const userId = req.query.user_id || MOCK_USER_ID;
-        const realFunds = await angelOneService.getRMSBalance();
-        const paperFunds = await supabaseService.getPaperFunds(userId);
-        res.json({
-            real: realFunds?.net || 0,
-            paper: paperFunds
-        });
+        const userId = await getSystemUser();
+        if (!userId) return res.json([]);
+        const trades = await supabaseService.getUserTrades(userId);
+        res.json(trades);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-server.listen(port, '0.0.0.0', () => {
-    console.log(`Backend listening at http://0.0.0.0:${port}`);
-    scannerService.start();
+app.get('/wallet', async (req, res) => {
+    try {
+        const userId = await getSystemUser();
+        if (!userId) return res.json({ balance: 0, mode: 'PAPER' });
+        
+        const settings = await supabaseService.getUserSettings(userId);
+        const mode = settings.trade_mode || 'PAPER';
+        
+        let balance = 0;
+        if (mode === 'REAL') {
+            const rms = await angelOneService.getRMSBalance();
+            balance = rms?.net || 0;
+        } else {
+            balance = await supabaseService.getPaperFunds(userId);
+        }
+        res.json({ balance, mode });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Alias for frontend compatibility (matches App.tsx line 187)
+app.get('/balances', async (req, res) => {
+    console.log(`[API] GET /balances requested...`);
+    try {
+        const userId = await getSystemUser();
+        if (!userId) return res.json({ real: 0, paper: 100000 });
+        
+        const settings = await supabaseService.getUserSettings(userId);
+        const mode = settings.trade_mode || 'PAPER';
+        
+        let real = 0;
+        let paper = 0;
+
+        // Fetch Real
+        const rms = await angelOneService.getRMSBalance();
+        real = rms?.net || 0;
+
+        // Fetch Paper
+        paper = await supabaseService.getPaperFunds(userId);
+        
+        res.json({ real, paper, mode });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/settings', async (req, res) => {
+    try {
+        const userId = await getSystemUser();
+        if (!userId) return res.status(404).json({ error: 'No user found' });
+        const settings = await supabaseService.getUserSettings(userId);
+        res.json(settings);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/settings', async (req, res) => {
+    try {
+        const userId = await getSystemUser();
+        if (!userId) throw new Error('No user found in DB');
+        // FIX: Using correct method name 'updateSettings'
+        await supabaseService.updateSettings(userId, req.body);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[SETTINGS POST ERROR]:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/history', async (req, res) => {
+    try {
+        const userId = await getSystemUser();
+        if (!userId) return res.json([]);
+        const settings = await supabaseService.getUserSettings(userId);
+        const history = await supabaseService.getHistory(settings.trade_mode || 'PAPER');
+        res.json(history);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/logs', async (req, res) => {
+    console.log(`[API] GET /logs requested...`);
+    try {
+        const limit = parseInt(req.query.limit) || 20;
+        const offset = parseInt(req.query.offset) || 0;
+        const logs = await supabaseService.getLogs(limit, offset);
+        res.json(logs || []);
+    } catch (error) {
+        console.error(`[API] Logs Error:`, error.message);
+        res.json([]);
+    }
+});
+
+app.post('/trade/manual', async (req, res) => {
+    const { symbol, side, price } = req.body;
+    try {
+        const userId = await getSystemUser();
+        if (!userId) throw new Error('No user found');
+
+        await angelOneService.loadSymbolMaster();
+        const scrip = angelOneService.symbolMaster.find(s => s.symbol.replace('-EQ', '').toUpperCase() === symbol.replace('-EQ', '').toUpperCase());
+        if (!scrip) throw new Error('Symbol not found');
+
+        const isBuy = side === 'BUY';
+        const sl = isBuy ? price * 0.98 : price * 1.02;
+        const tp = isBuy ? price * 1.04 : price * 0.96;
+
+        const settings = await supabaseService.getUserSettings(userId);
+        const mode = settings.trade_mode || 'PAPER';
+
+        // Dynamic Quantity for Manual Trade
+        const quantity = await scannerService.calculateQuantity(userId, price, sl, mode);
+
+        if (quantity <= 0) {
+            return res.status(400).json({ error: 'Insufficient funds for 1 share' });
+        }
+
+        if (mode === 'REAL') {
+            await angelOneService.placeOrder(symbol, scrip.token, quantity, side, 'LIMIT', price);
+        }
+
+        await supabaseService.saveTrade({
+            user_id: userId,
+            symbol,
+            symbolToken: scrip.token,
+            entry_price: price,
+            stop_loss: sl,
+            take_profit: tp,
+            quantity: quantity,
+            side: side,
+            type: side,
+            status: 'OPEN',
+            trade_mode: 'MANUAL',
+            trading_type: mode
+        });
+
+        if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL' });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ────────────────────────────────────────────────────────────────
+// SERVER START
+// ────────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', async () => {
+    console.log(`Backend listening at http://0.0.0.0:${PORT}`);
+    try {
+        await angelOneService.login();
+        scannerService.start();
+    } catch (error) {
+        console.error('Initial Login Error:', error.message);
+    }
+});
+
+io.on('connection', (socket) => {
+    console.log('Client connected:', socket.id);
+    socket.on('disconnect', () => console.log('Client disconnected'));
 });

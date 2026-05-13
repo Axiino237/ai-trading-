@@ -3,37 +3,62 @@ require('dotenv').config();
 
 class GeminiService {
     constructor() {
-        this.keys = (process.env.GEMINI_API_KEYS || '').split(',').filter(k => k.trim());
-        this.currentIndex = 0;
-        this.instances = this.keys.map(key => new GoogleGenerativeAI(key));
+        // Load all keys from .env
+        this.apiKeys = process.env.GEMINI_API_KEYS ? process.env.GEMINI_API_KEYS.split(',') : [];
+        this.currentKeyIndex = 0;
+        this.modelName = 'gemini-flash-latest'; // More stable than 1.5-flash alias
     }
 
-    getNextInstance() {
-        if (this.instances.length === 0) return null;
-        const instance = this.instances[this.currentIndex];
-        this.currentIndex = (this.currentIndex + 1) % this.instances.length;
-        return instance;
+    /**
+     * Get the current working GenAI instance
+     */
+    getGenAI() {
+        const key = this.apiKeys[this.currentKeyIndex];
+        return new GoogleGenerativeAI(key);
     }
 
-    async generateAnalysis(prompt, retryCount = 0) {
-        const genAI = this.getNextInstance();
-        if (!genAI) throw new Error('No Gemini API keys configured');
+    /**
+     * Rotate to the next key if current one fails
+     */
+    rotateKey() {
+        this.currentKeyIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
+        console.log(`[GEMINI] Rotating to API Key Index: ${this.currentKeyIndex}`);
+    }
 
-        try {
-            const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
-            const result = await model.generateContent(prompt);
-            const text = (await result.response).text();
-            return text;
-        } catch (error) {
-            console.error(`[GEMINI] Key ${this.currentIndex} failed:`, error.message);
-            
-            // If we hit a rate limit or service error, try the next key
-            if (retryCount < this.keys.length) {
-                console.log(`[GEMINI] Retrying with next key... (${retryCount + 1}/${this.keys.length})`);
-                return this.generateAnalysis(prompt, retryCount + 1);
-            }
-            throw error;
+    /**
+     * Core function to generate analysis with auto-retry on different keys
+     */
+    async generateAnalysis(prompt, retries = 3) {
+        if (this.apiKeys.length === 0) {
+            throw new Error('No Gemini API keys found in .env');
         }
+
+        for (let i = 0; i < this.apiKeys.length; i++) {
+            try {
+                const genAI = this.getGenAI();
+                const model = genAI.getGenerativeModel({ model: this.modelName });
+                
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                return response.text();
+                
+            } catch (error) {
+                console.error(`[GEMINI] Error with key ${this.currentKeyIndex}:`, error.message);
+                
+                // If 404, might be model name, but usually it's key limit or regional
+                if (error.message.includes('429') || error.message.includes('Quota') || error.message.includes('404')) {
+                    this.rotateKey();
+                } else {
+                    // Other errors we might want to throw immediately
+                    this.rotateKey();
+                }
+                
+                // Wait a bit before next key if it was a rate limit
+                await new Promise(r => setTimeout(r, 500));
+            }
+        }
+        
+        throw new Error('All Gemini API keys failed or reached quota limits');
     }
 }
 
