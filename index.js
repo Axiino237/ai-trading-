@@ -205,6 +205,70 @@ app.get('/logs', async (req, res) => {
     }
 });
 
+app.post('/trade/close', async (req, res) => {
+    const { tradeId } = req.body;
+    console.log(`[TRADE] Request to close trade: ${tradeId}`);
+    try {
+        // 1. Get trade details from Supabase
+        const { data: trade, error } = await supabaseService.supabase
+            .from('trades')
+            .select('*')
+            .eq('id', tradeId)
+            .single();
+
+        if (error || !trade) throw new Error('Trade not found');
+        if (trade.status === 'CLOSED') throw new Error('Trade already closed');
+
+        const isReal = trade.side.includes('REAL');
+        const symbol = trade.symbol;
+        const quantity = trade.quantity || 1;
+        const oppositeSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
+
+        let exitPrice = 0;
+
+        // 2. If Real, execute exit order on Angel One
+        if (isReal) {
+            console.log(`[ANGEL] Exiting REAL position for ${symbol}...`);
+            const quote = await angelOneService.getQuote(symbol);
+            exitPrice = quote.lastTradedPrice;
+
+            await angelOneService.placeOrder(
+                symbol,
+                quote.symbolToken,
+                quantity,
+                oppositeSide,
+                "MARKET"
+            );
+            console.log(`[ANGEL] Exit order placed for ${symbol} @ ${exitPrice} ✅`);
+        } else {
+            // If Paper, just get current quote for exit price
+            try {
+                const quote = await angelOneService.getQuote(symbol);
+                exitPrice = quote.lastTradedPrice;
+            } catch (e) {
+                exitPrice = trade.entry_price; // Fallback
+            }
+        }
+
+        // 3. Update Supabase record
+        const { error: updateError } = await supabaseService.supabase
+            .from('trades')
+            .update({
+                status: 'CLOSED',
+                exit_price: exitPrice,
+                closed_at: new Date().toISOString()
+            })
+            .eq('id', tradeId);
+
+        if (updateError) throw updateError;
+
+        res.json({ success: true, message: `Trade ${symbol} closed at ${exitPrice}` });
+    } catch (error) {
+        console.error(`[TRADE] Close Error:`, error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/analyze', async (req, res) => {
     const { symbol } = req.body;
     try {
@@ -280,63 +344,6 @@ app.post('/trade/manual', async (req, res) => {
         if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL' });
         res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/trade/close', async (req, res) => {
-    const { tradeId } = req.body;
-    try {
-        const trade = await supabaseService.getTradeById(tradeId);
-        if (!trade) return res.status(404).json({ error: 'Trade not found' });
-        if (trade.status === 'CLOSED') return res.status(400).json({ error: 'Trade already closed' });
-
-        const isReal = trade.side.includes('_REAL');
-        let exitPrice = 0;
-
-        // 1. Get current price
-        const quote = await angelOneService.getQuote(trade.symbol);
-        exitPrice = quote.lastTradedPrice;
-
-        if (isReal) {
-            // 2. Real mode → Place exit order on Angel One
-            const exitSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
-            const scripResults = await angelOneService.searchScrip('NSE', trade.symbol);
-            const token = scripResults.data?.[0]?.symbolToken;
-
-            await angelOneService.placeOrder(
-                trade.symbol,
-                token,
-                trade.quantity || 1,
-                exitSide,
-                'MARKET',
-                0
-            );
-            console.log(`[REAL EXIT] Market exit order placed for ${trade.symbol}`);
-        } else {
-            // 3. Paper mode → Credit funds back to paper wallet
-            const qty = trade.quantity || 1;
-            const originalCost = trade.entry_price * qty;
-            const isBuy = trade.type === 'BUY';
-            const pnl = isBuy ? (exitPrice - trade.entry_price) * qty : (trade.entry_price - exitPrice) * qty;
-            const creditAmount = originalCost + pnl;
-            
-            await supabaseService.creditPaperFunds(trade.user_id, creditAmount);
-            console.log(`[PAPER EXIT] Credited ₹${creditAmount.toFixed(2)} to wallet for ${trade.symbol}`);
-        }
-
-        // 4. Mark as CLOSED in DB
-        await supabaseService.updateTradeStatus(tradeId, {
-            status: 'CLOSED',
-            exit_price: exitPrice
-        });
-
-        // 5. Notify UI
-        if (global.io) global.io.emit('trade-executed', { symbol: trade.symbol, mode: 'EXIT' });
-
-        res.json({ success: true, exitPrice });
-    } catch (error) {
-        console.error('Close Trade Error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
