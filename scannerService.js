@@ -38,10 +38,8 @@ class ScannerService {
         const run = async () => {
             try {
                 const defaultSymbols = ['RELIANCE-EQ', 'TATASTEEL-EQ', 'SBIN-EQ', 'HDFCBANK-EQ', 'INFY-EQ'];
-                const MOCK_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
                 
-                const list = await supabaseService.getUserWatchlist(MOCK_USER_ID);
-                const userSymbols = list.map(item => item.symbol);
+                const userSymbols = await supabaseService.getAllWatchlistSymbols();
 
                 const symbols = [...new Set([...defaultSymbols, ...userSymbols])];
                 const quotes = await angelOneService.getMultipleQuotes(symbols);
@@ -79,63 +77,100 @@ class ScannerService {
 
         try {
             const users = await supabaseService.getAutoEnabledUsers();
-            
+            if (users.length === 0) {
+                logger.info('[SCANNER] No auto-trading users found. Skipping scan cycle.');
+                return;
+            }
+
+            // 1. COLLECT ALL UNIQUE SYMBOLS ACROSS ALL USERS
+            const allSymbolsSet = new Set();
+            const userWatchlists = {}; // userId -> symbols[]
+
             for (const user of users) {
-                const userId = user.user_id; // Dynamic from DB
-                if (!userId) continue;
-                const settings = await supabaseService.getUserSettings(userId);
+                const watchlist = await supabaseService.getUserWatchlist(user.user_id);
+                const symbols = (watchlist || []).map(item => item.symbol);
+                userWatchlists[user.user_id] = symbols;
+                symbols.forEach(s => allSymbolsSet.add(s));
+            }
+
+            const uniqueSymbols = Array.from(allSymbolsSet);
+            if (uniqueSymbols.length === 0) {
+                logger.info('[SCANNER] Total watchlist is empty across all users.');
+                return;
+            }
+
+            logger.info(`[SCANNER] Batch Scanning ${uniqueSymbols.length} unique symbols for ${users.length} users...`);
+
+            // 2. FETCH ALL QUOTES IN ONE BATCH CALL
+            const quotesArray = await angelOneService.getMultipleQuotes(uniqueSymbols);
+            const quotesMap = new Map();
+            (quotesArray || []).forEach(q => quotesMap.set(q.tradingSymbol, q));
+
+            // 3. CACHE FOR INDICATORS (Computed once per symbol per scan)
+            const indicatorCache = new Map();
+
+            // 4. PROCESS EACH USER INDIVIDUALLY (Personal Risk Logic)
+            for (const user of users) {
+                const userId = user.user_id;
                 const todayCount = await supabaseService.getTodayTradeCount(userId);
-                const limit = settings.daily_trade_limit || 5;
+                
+                // ENFORCE PLAN LIMITS (Gating Logic)
+                const planLimit = user.plan_tier === 'PRO' ? 100 : 5;
+                const currentLimit = Math.min(user.max_trades_per_day || 5, planLimit);
 
-                logger.info(`[SCANNER] Monitoring User ID: ${userId}. Trades today: ${todayCount}/${limit}`);
-
-                if (todayCount >= limit) {
-                    logger.info(`[SCANNER] User reached per-day limit. Skipping scan.`);
+                if (todayCount >= currentLimit) {
+                    logger.info(`[SCANNER] User ${userId} (${user.plan_tier}) reached daily limit (${todayCount}/${currentLimit}). Skipping.`);
                     continue;
                 }
 
-                // FETCH USER WATCHLIST ONLY
-                const watchlist = await supabaseService.getUserWatchlist(userId);
-                const symbols = watchlist.map(item => item.symbol);
-
-                if (symbols.length === 0) {
-                    logger.info(`[SCANNER] Watchlist empty for user: ${userId}. Skipping.`);
-                    continue;
-                }
-
-                logger.info(`[SCANNER] Scanning ${symbols.length} watchlist stocks for ID: ${userId}...`);
-
+                const symbols = userWatchlists[userId] || [];
                 for (const sym of symbols) {
-                    await this.processEnterpriseFlow(sym, user.user_id, settings.auto_trade_on);
-                    await new Promise(r => setTimeout(r, 1500)); 
+                    const quote = quotesMap.get(sym);
+                    if (!quote) continue;
+
+                    // Fetch or compute indicators (using cache)
+                    let indicators = indicatorCache.get(sym);
+                    if (!indicators) {
+                        const candles = await angelOneService.getCandleData(sym, 'FIVE_MINUTE', 5);
+                        if (candles && candles.length > 0) {
+                            indicators = {
+                                ema9: ta.calculateEMA(candles, 9),
+                                ema20: ta.calculateEMA(candles, 20),
+                                ema50: ta.calculateEMA(candles, 50),
+                                rsi: ta.calculateRSI(candles),
+                                macd: ta.calculateMACD(candles),
+                                volume: quote.volume || candles[candles.length - 1][5],
+                                avgVolume: ta.calculateAvgVolume(candles, 20),
+                                candles: candles
+                            };
+                            indicatorCache.set(sym, indicators);
+                        }
+                    }
+
+                    if (indicators) {
+                        // Pass quote and indicators to processEnterpriseFlow
+                        await this.processEnterpriseFlow(sym, userId, settings.auto_trade_on, quote, indicators);
+                    }
+                    
+                    // Small delay to prevent CPU spikes
+                    await new Promise(r => setTimeout(r, 200));
                 }
             }
         } catch (error) {
-            console.error('[SCANNER] Fatal Error:', error.message);
+            console.error('[SCANNER] Fatal Error during batch scan:', error.message);
         } finally {
             this.isScanning = false;
         }
     }
 
-    async processEnterpriseFlow(symbol, userId, autoTradeOn) {
-        try {
-            const quote = await angelOneService.getQuote(symbol);
-            const candles = await angelOneService.getCandleData(symbol, 'FIVE_MINUTE', 5);
-            if (!quote || !candles) return;
 
-            const indicators = {
-                ema9: ta.calculateEMA(candles, 9),
-                ema20: ta.calculateEMA(candles, 20),
-                ema50: ta.calculateEMA(candles, 50),
-                rsi: ta.calculateRSI(candles),
-                macd: ta.calculateMACD(candles),
-                volume: quote.volume || candles[candles.length - 1][5],
-                avgVolume: ta.calculateAvgVolume(candles, 20),
-                candles: candles
-            };
+    async processEnterpriseFlow(symbol, userId, autoTradeOn, quote, indicators) {
+        try {
+            if (!quote || !indicators) return;
 
             const settings = await supabaseService.getUserSettings(userId);
             const rules = ta.checkRules(indicators, settings.scan_mode || 'STRICT');
+
 
             if (global.io) {
                 global.io.emit('symbol-status', {
@@ -169,6 +204,8 @@ class ScannerService {
                 logger.info(`[SCANNER] Automation OFF for User. Skipping AI Analysis for ${symbol}.`);
                 return;
             }
+
+            const tradingMode = settings.trade_mode || 'PAPER';
 
             // RE-CHECK PER-DAY LIMIT
             const todayCount = await supabaseService.getTodayTradeCount(userId);
@@ -226,6 +263,9 @@ class ScannerService {
             // NEW: Calculate dynamic quantity based on Advanced Risk management
             const quantity = await this.calculateQuantity(userId, quote.lastTradedPrice, risk.sl, tradingMode);
 
+            // Fetch per-user credentials
+            const creds = await supabaseService.getBrokerCredentials(userId);
+
             // Send Telegram Notification (Execution)
             if (quantity > 0) {
                 await telegramService.sendTradeAlert({
@@ -240,10 +280,10 @@ class ScannerService {
                     tradeMode: tradingMode,
                     holdingType: holdingType,
                     expectedDuration: aiResult.suggestedHolding || 'N/A'
-                });
+                }, creds);
 
                 console.log(`[EXECUTION] Placing ${aiResult.sentiment} order for ${symbol} (Qty: ${quantity})... 💰`);
-                await this.executeTrade(userId, symbol, quote.symbolToken, aiResult.sentiment, risk, quantity, holdingType, aiResult.suggestedHolding);
+                await this.executeTrade(userId, symbol, quote.symbolToken, aiResult.sentiment, risk, quantity, holdingType, aiResult.suggestedHolding, creds);
             } else {
                 console.log(`[EXECUTION SKIPPED] ${symbol} - Insufficient capital or risk limit reached.`);
             }
@@ -275,7 +315,14 @@ class ScannerService {
             return result;
         } catch (e) {
             console.error('[AI ENGINE ERROR]:', e.message);
-            return { sentiment: 'NEUTRAL', confidenceScore: 0, holdingType: 'SHORT_TERM' };
+            return { 
+                sentiment: 'NEUTRAL', 
+                confidenceScore: 0, 
+                holdingType: 'ERROR', 
+                explanation: e.message.includes('quota') || e.message.includes('429') 
+                    ? 'Gemini API limit reached (20 req/day). Please wait or add new keys.' 
+                    : 'AI engine temporarily unavailable due to limits.'
+            };
         }
     }
 
@@ -369,20 +416,17 @@ class ScannerService {
         }
     }
 
-    async executeTrade(userId, symbol, token, side, risk, quantity = 1, holdingType = 'SHORT_TERM', duration = null) {
-        try {
-            logger.info(`[EXECUTION START] Processing ${side} for ${symbol} (Qty: ${quantity}, Type: ${holdingType})...`);
-            
-            const settings = await supabaseService.getUserSettings(userId);
-            const tradingType = settings.trade_mode || 'PAPER';
+    async executeTrade(userId, symbol, token, side, risk, quantity = 1, holdingType = 'SHORT_TERM', duration = null, creds = null) {
+        let tradeRecord = null;
+        const settings = await supabaseService.getUserSettings(userId);
+        const tradingType = settings.trade_mode || 'PAPER';
 
-            if (tradingType === 'REAL') {
-                logger.info(`[ANGEL ONE] Placing REAL order for ${symbol}...`);
-                await angelOneService.placeOrder(symbol, token, quantity, side, 'LIMIT', risk.entry);
-            }
+        try {
+            logger.info(`[EXECUTION START] Processing ${side} for ${symbol} (Qty: ${quantity}, Mode: ${tradingType})...`);
             
-            logger.info(`[DATABASE] Saving ${tradingType} trade to Supabase...`);
-            await supabaseService.saveTrade({
+            // 1. Always save to DB first (Ensures we have a record of the attempt)
+            logger.info(`[DATABASE] Creating ${tradingType} trade record...`);
+            const dbResult = await supabaseService.saveTrade({
                 user_id: userId,
                 symbol,
                 symbolToken: token,
@@ -397,20 +441,51 @@ class ScannerService {
                 holding_type: holdingType,
                 expected_duration: duration
             });
-            logger.success(`[DATABASE] Trade saved successfully for ${symbol}! ✅`);
+            
+            tradeRecord = dbResult.data?.[0];
 
-            // Notify UI
+            // 2. If REAL mode, execute on Broker
+            if (tradingType === 'REAL') {
+                try {
+                    logger.info(`[ANGEL ONE] Placing REAL order for ${symbol}...`);
+                    if (!creds || !creds.api_key) {
+                        throw new Error('Broker credentials not configured for this user.');
+                    }
+                    const orderRes = await angelOneService.placeUserOrder(creds, symbol, token, quantity, side, 'LIMIT', risk.entry);
+                    
+                    if (!orderRes.status) {
+                        throw new Error(orderRes.message || 'Broker order rejected');
+                    }
+                    logger.success(`[ANGEL ONE] Order success: ${orderRes.data?.orderid}`);
+                } catch (brokerError) {
+                    logger.error(`[EXECUTION FAILED] Broker rejected order: ${brokerError.message}`);
+                    
+                    // Update DB record to FAILED if it was created
+                    if (tradeRecord?.id) {
+                        await supabaseService.supabase
+                            .from('trades')
+                            .update({ status: 'FAILED', message: brokerError.message })
+                            .eq('id', tradeRecord.id);
+                    }
+                    throw brokerError;
+                }
+            }
+            
+            logger.success(`[DATABASE] Trade sequence complete for ${symbol}! ✅`);
+
+            // 3. Notify UI
             if (global.io) {
-                logger.info(`[WEBSOCKET] Broadcasting UI Refresh...`);
-                global.io.emit('trade-executed', { symbol, mode: 'BOT' });
+                global.io.emit('trade-executed', { symbol, mode: 'BOT', userId });
             }
 
             logger.success(`[EXECUTION COMPLETE] ${symbol} is now LIVE on Dashboard! 🚀`);
         } catch (error) {
             logger.error(`[EXECUTION FATAL ERROR] ${symbol}: ${error.message}`);
+            // Re-throw to handle higher up if needed
             throw error; 
         }
     }
+
 
     /**
      * MONITOR OPEN POSITIONS (Auto-Exit SL/TP)
@@ -446,6 +521,8 @@ class ScannerService {
                     if (shouldClose) {
                         console.log(`[MONITOR] ${trade.symbol} Hit ${exitReason}! Closing position at ₹${ltp}... 🚪`);
 
+                        const creds = await supabaseService.getBrokerCredentials(trade.user_id);
+
                         // 1. REAL MODE → Place actual exit order on Angel One
                         if (trade.trading_type === 'REAL') {
                             try {
@@ -453,7 +530,13 @@ class ScannerService {
                                 // BUY trade exit = SELL order | SELL trade exit = BUY order
                                 const exitSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
                                 logger.info(`[ANGEL EXIT] Placing REAL ${exitSide} exit order for ${trade.symbol} @ ₹${ltp}...`);
-                                await angelOneService.placeOrder(
+                                
+                                if (!creds || !creds.api_key) {
+                                    throw new Error('Broker credentials not configured for this user.');
+                                }
+
+                                await angelOneService.placeUserOrder(
+                                    creds,
                                     trade.symbol,
                                     trade.symbolToken,
                                     trade.quantity || 1,
@@ -485,12 +568,12 @@ class ScannerService {
                             const isBuy = trade.type === 'BUY';
                             const pnl = isBuy ? (ltp - trade.entry_price) * qty : (trade.entry_price - ltp) * qty;
                             const creditAmount = originalCost + pnl;
-                            await supabaseService.creditPaperFunds(trade.user_id, creditAmount);
+                            await supabaseService.creditPaperFunds(trade.user_id, creditAmount, 'TRADE_EXIT', trade.id);
                             logger.info(`[MONITOR] Credited ₹${creditAmount.toFixed(2)} to paper wallet for ${trade.symbol}`);
                         }
 
                         // 4. Notify UI & Telegram
-                        if (global.io) global.io.emit('trade-executed', { symbol: trade.symbol, mode: 'EXIT', reason: exitReason });
+                        if (global.io) global.io.emit('trade-executed', { symbol: trade.symbol, mode: 'EXIT', reason: exitReason, userId: trade.user_id });
                         
                         const telegramService = require('./telegramService');
                         const qty = trade.quantity || 1;
@@ -504,7 +587,7 @@ class ScannerService {
                             pnl: pnlVal,
                             entryPrice: trade.entry_price,
                             tradeMode: trade.trading_type || 'PAPER'
-                        });
+                        }, creds);
                         logger.success(`[MONITOR] ${trade.symbol} EXIT complete. P&L: ₹${pnlVal.toFixed(2)} | Reason: ${exitReason}`);
                     }
                 } catch (e) {

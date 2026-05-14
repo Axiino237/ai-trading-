@@ -7,12 +7,15 @@ class TelegramService {
         this.chatId = process.env.TELEGRAM_CHAT_ID;
     }
 
-    async sendMessage(message) {
-        if (!this.token || !this.chatId) {
+    async sendMessage(message, customToken = null, customChatId = null) {
+        const token = customToken || this.token;
+        const chatId = customChatId || this.chatId;
+
+        if (!token || !chatId) {
             console.warn('[TELEGRAM] Config missing, skipping notification');
             return;
         }
-        const url = `https://api.telegram.org/bot${this.token}/sendMessage`;
+        const url = `https://api.telegram.org/bot${token}/sendMessage`;
         try {
             await axios.post(url, {
                 chat_id: this.chatId,
@@ -25,7 +28,7 @@ class TelegramService {
         }
     }
 
-    async sendTradeAlert(tradeData) {
+    async sendTradeAlert(tradeData, customCreds = null) {
         const {
             symbol, side, sentiment, price, sl, tp,
             confidence, action, pnl, tradeMode,
@@ -143,7 +146,7 @@ _📊 Dashboard updated_
             `;
         }
 
-        if (message) await this.sendMessage(message);
+        if (message) await this.sendMessage(message, customCreds?.telegram_bot_token, customCreds?.telegram_chat_id);
     }
 }
 

@@ -233,6 +233,25 @@ class AngelOneService {
         }
     }
 
+    async getUserRMSBalance(userCreds) {
+        try {
+            const { SmartAPI } = require('smartapi-javascript');
+            const { TOTP } = require('totp-generator');
+            
+            const userApi = new SmartAPI({ api_key: userCreds.api_key });
+            const { otp: totpToken } = await TOTP.generate(userCreds.totp_secret);
+            const loginRes = await userApi.generateSession(userCreds.client_id, userCreds.password, totpToken);
+            
+            if (!loginRes.status) return null;
+
+            const response = await userApi.getRMS();
+            return response.data;
+        } catch (error) {
+            console.error('getUserRMSBalance error:', error.message);
+            return null;
+        }
+    }
+
     async placeOrder(symbol, symbolToken, quantity, side, type = "LIMIT", price = 0) {
         await this.ensureSession();
         try {

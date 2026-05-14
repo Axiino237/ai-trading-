@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const { randomUUID } = require('crypto');
 require('dotenv').config();
 
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -9,6 +10,90 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 class SupabaseService {
     constructor() {
         this.supabase = supabase;
+    }
+
+    async getUserByEmail(email) {
+        const { data, error } = await supabase
+            .from('app_users')
+            .select('*')
+            .ilike('email', email)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') return null;
+            throw error;
+        }
+        return data;
+    }
+
+    async getUserById(id) {
+        const { data, error } = await supabase
+            .from('app_users')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') return null;
+            throw error;
+        }
+        return data;
+    }
+
+    async createUser(user) {
+        const { data, error } = await supabase
+            .from('app_users')
+            .insert([user])
+            .select('id, name, email, role, created_at')
+            .single();
+
+        if (error) {
+            if (error.message && error.message.includes('relation "app_users" does not exist')) {
+                throw new Error('app_users table is missing. Run the auth migration SQL first.');
+            }
+            throw error;
+        }
+        return data;
+    }
+
+    async createSession(session) {
+        const { data, error } = await supabase
+            .from('app_sessions')
+            .insert([session])
+            .select('*')
+            .single();
+
+        if (error) {
+            if (error.message && error.message.includes('relation "app_sessions" does not exist')) {
+                throw new Error('app_sessions table is missing. Run the auth migration SQL first.');
+            }
+            throw error;
+        }
+        return data;
+    }
+
+    async getSession(tokenHash) {
+        const { data, error } = await supabase
+            .from('app_sessions')
+            .select('*')
+            .eq('token_hash', tokenHash)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') return null;
+            throw error;
+        }
+        return data;
+    }
+
+    async deleteSession(tokenHash) {
+        const { error } = await supabase
+            .from('app_sessions')
+            .delete()
+            .eq('token_hash', tokenHash);
+
+        if (error) throw error;
+        return true;
     }
     /**
      * Save a generated signal/trade to DB
@@ -46,17 +131,18 @@ class SupabaseService {
                 }]);
 
             if (error) throw error;
+            const newTrade = data?.[0];
 
             // 3. Actually deduct the funds now that DB insert is successful
-            if (tradeData.trading_type === 'PAPER') {
+            if (tradeData.trading_type === 'PAPER' && newTrade) {
                 const totalCost = (tradeData.entry_price || 0) * (tradeData.quantity || 1);
-                await this.deductPaperFunds(tradeData.user_id, totalCost);
+                await this.deductPaperFunds(tradeData.user_id, totalCost, 'TRADE_ENTRY', newTrade.id);
             }
 
             return { success: true, data };
         } catch (error) {
             console.error('Supabase Save Error:', error.message);
-            return { success: false, error: error.message };
+            throw error;
         }
     }
 
@@ -79,6 +165,22 @@ class SupabaseService {
         }
     }
 
+    async getUserTrades(userId) {
+        try {
+            const { data, error } = await supabase
+                .from('trades')
+                .select('*')
+                .eq('user_id', userId)
+                .order('created_at', { ascending: false });
+
+            if (error) throw error;
+            return data || [];
+        } catch (error) {
+            console.error('Supabase User Trades Error:', error.message);
+            return [];
+        }
+    }
+
     /**
      * Get all users who have auto-trading enabled
      */
@@ -86,11 +188,15 @@ class SupabaseService {
         try {
             const { data, error } = await supabase
                 .from('auto_settings')
-                .select('user_id')
+                .select('*, app_users(plan_tier)')
                 .eq('is_auto_active', true);
 
             if (error) throw error;
-            return data || [];
+            // Flatten the result to make it easier to use
+            return (data || []).map(item => ({
+                ...item,
+                plan_tier: item.app_users?.plan_tier || 'STARTER'
+            }));
         } catch (error) {
             console.error('Supabase Fetch Enabled Users Error:', error.message);
             return [];
@@ -149,6 +255,19 @@ class SupabaseService {
     }
 
     /**
+     * Get all unique symbols across ALL users for broadcasting
+     */
+    async getAllWatchlistSymbols() {
+        try {
+            const { data, error } = await supabase.from('watchlist').select('symbol');
+            if (error) return [];
+            return [...new Set(data.map(r => r.symbol))];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    /**
      * Remove symbol from user's watchlist
      */
     async removeFromWatchlist(userId, symbol) {
@@ -176,34 +295,202 @@ class SupabaseService {
                 .select('balance')
                 .eq('user_id', userId)
                 .single();
-            return data ? data.balance : 100000;
+            return data ? parseFloat(data.balance) : 100000;
         } catch (e) { return 100000; }
     }
 
-    async deductPaperFunds(userId, amount) {
+    async deductPaperFunds(userId, amount, reason = 'UNKNOWN', tradeId = null) {
         try {
             const current = await this.getPaperFunds(userId);
-            const newBalance = current - amount;
-            await supabase
+            const amt = parseFloat(amount);
+            const newBalance = parseFloat((current - amt).toFixed(2));
+            
+            // 1. Update Balance
+            const { error } = await supabase
                 .from('paper_funds')
                 .upsert({ user_id: userId, balance: newBalance }, { onConflict: 'user_id' });
+            
+            if (error) throw error;
+
+            // 2. Log Transaction
+            await this.logWalletAction(userId, amt, 'DEBIT', reason, newBalance, tradeId);
+            
             return newBalance;
         } catch (e) {
             console.error('Wallet deduction failed:', e.message);
+            throw e;
         }
     }
 
-    async creditPaperFunds(userId, amount) {
+    async creditPaperFunds(userId, amount, reason = 'UNKNOWN', tradeId = null) {
         try {
             const current = await this.getPaperFunds(userId);
-            const newBalance = current + amount;
-            await supabase
+            const amt = parseFloat(amount);
+            const newBalance = parseFloat((current + amt).toFixed(2));
+            
+            // 1. Update Balance
+            const { error } = await supabase
                 .from('paper_funds')
                 .upsert({ user_id: userId, balance: newBalance }, { onConflict: 'user_id' });
+            
+            if (error) throw error;
+
+            // 2. Log Transaction
+            await this.logWalletAction(userId, amt, 'CREDIT', reason, newBalance, tradeId);
+            
             return newBalance;
         } catch (e) {
             console.error('Wallet credit failed:', e.message);
+            throw e;
         }
+    }
+
+    async logWalletAction(userId, amount, type, reason, balanceAfter, tradeId = null) {
+        try {
+            await supabase.from('wallet_logs').insert([{
+                user_id: userId,
+                amount,
+                type,
+                reason,
+                balance_after: balanceAfter,
+                trade_id: tradeId,
+                created_at: new Date().toISOString()
+            }]);
+        } catch (e) {
+            console.error('[AUDIT ERROR] Failed to log wallet action:', e.message);
+        }
+    }
+
+    async createPaymentRequest(userId, payload) {
+        const amount = Number(payload.amount);
+        if (!amount || amount <= 0) {
+            throw new Error('Amount must be greater than 0');
+        }
+
+        const transactionId = String(payload.transaction_id || payload.transactionId || '').trim();
+        if (!transactionId) {
+            throw new Error('Transaction ID is required');
+        }
+
+        const request = {
+            id: randomUUID(),
+            user_id: userId,
+            amount,
+            transaction_id: transactionId,
+            qr_reference: payload.qr_reference || null,
+            note: payload.note || null,
+            status: 'PENDING',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+        };
+
+        const { data, error } = await supabase
+            .from('payment_requests')
+            .insert([request])
+            .select()
+            .single();
+
+        if (error) {
+            if (error.message && error.message.includes('relation "payment_requests" does not exist')) {
+                throw new Error('payment_requests table is missing. Run the payment migration SQL first.');
+            }
+            throw error;
+        }
+
+        return data;
+    }
+
+    async getPaymentRequests(options = {}) {
+        const limit = options.limit || 50;
+        let query = supabase
+            .from('payment_requests')
+            .select('*, app_users(name)')
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        if (options.userId) {
+            query = query.eq('user_id', options.userId);
+        }
+
+        if (options.status) {
+            query = query.eq('status', options.status);
+        }
+
+        const { data, error } = await query;
+        if (error) {
+            if (error.message && error.message.includes('relation "payment_requests" does not exist')) {
+                return [];
+            }
+            throw error;
+        }
+        return data || [];
+    }
+
+    async getPaymentRequestById(id) {
+        const { data, error } = await supabase
+            .from('payment_requests')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (error) throw error;
+        return data;
+    }
+
+    async updatePaymentRequest(id, updates) {
+        const { data, error } = await supabase
+            .from('payment_requests')
+            .update({
+                ...updates,
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+        return data;
+    }
+
+    async approvePaymentRequest(id, adminMeta = {}) {
+        const existing = await this.getPaymentRequestById(id);
+        if (!existing) throw new Error('Payment request not found');
+        if (existing.status === 'APPROVED') throw new Error('Payment request already approved');
+        if (existing.status === 'REJECTED') throw new Error('Rejected payment request cannot be approved');
+
+        // Check if this is a subscription upgrade request
+        if (existing.note && existing.note.startsWith('SUBSCRIPTION_UPGRADE:')) {
+            const plan = existing.note.split(':')[1];
+            const { error: upgradeError } = await supabase
+                .from('app_users')
+                .update({ plan_tier: plan })
+                .eq('id', existing.user_id);
+            
+            if (upgradeError) throw upgradeError;
+            console.log(`[SUBSCRIPTION] User ${existing.user_id} upgraded to ${plan} via approved payment ✅`);
+        } else {
+            // Standard wallet fund request
+            await this.creditPaperFunds(existing.user_id, Number(existing.amount), 'DEPOSIT', existing.id);
+        }
+
+        return this.updatePaymentRequest(id, {
+            status: 'APPROVED',
+            approved_at: new Date().toISOString(),
+            approved_by: adminMeta.approvedBy || 'ADMIN',
+            admin_note: adminMeta.adminNote || null
+        });
+    }
+
+    async rejectPaymentRequest(id, adminMeta = {}) {
+        const existing = await this.getPaymentRequestById(id);
+        if (!existing) throw new Error('Payment request not found');
+        if (existing.status === 'APPROVED') throw new Error('Approved payment request cannot be rejected');
+
+        return this.updatePaymentRequest(id, {
+            status: 'REJECTED',
+            admin_note: adminMeta.adminNote || null,
+            approved_by: adminMeta.approvedBy || 'ADMIN'
+        });
     }
 
     /**
@@ -316,14 +603,21 @@ class SupabaseService {
     /**
      * Save System Activity Log
      */
-    async saveLog(level, symbol, message, data) {
+    async saveLog(level, symbol, message, data, userId = null) {
         try {
             await supabase.from('system_logs').insert([{
-                level, symbol, message, data,
+                level, 
+                symbol, 
+                message, 
+                data,
+                user_id: userId,
                 created_at: new Date().toISOString()
             }]);
-        } catch (e) {}
+        } catch (e) {
+            console.error('[LOG ERROR]', e.message);
+        }
     }
+
 
     /**
      * Get Logs with Pagination (Lazy Loading)
@@ -414,6 +708,152 @@ class SupabaseService {
             return { SHORT_TERM: 0, LONG_TERM: 0 };
         }
     }
+
+    /**
+     * Get Invested Capital for a user (Total entry cost of OPEN trades)
+     */
+    async getInvestedCapitalAmount(userId, tradingMode) {
+        try {
+            const { data, error } = await supabase
+                .from('trades')
+                .select('entry_price, quantity')
+                .eq('user_id', userId)
+                .eq('status', 'OPEN')
+                .ilike('side', `%_${tradingMode}`);
+
+            if (error) throw error;
+            return (data || []).reduce((acc, t) => acc + (Number(t.entry_price) * (t.quantity || 1)), 0);
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    async getUserSettings(userId) {
+        try {
+            const { data, error } = await supabase
+                .from('auto_settings')
+                .select('*')
+                .eq('user_id', userId)
+                .single();
+            if (error && error.code !== 'PGRST116') throw error;
+            return data || { trade_mode: 'PAPER', scan_mode: 'STRICT', max_trades: 5, is_auto_active: false };
+        } catch (e) {
+            console.error('getUserSettings Error:', e.message);
+            return { trade_mode: 'PAPER', scan_mode: 'STRICT', max_trades: 5, is_auto_active: false };
+        }
+    }
+
+    async updateSettings(userId, updates) {
+        try {
+            // First check if a settings record exists for this user
+            const { data: existing } = await supabase
+                .from('auto_settings')
+                .select('id')
+                .eq('user_id', userId)
+                .single();
+
+            const payload = { 
+                user_id: userId,
+                ...updates
+            };
+
+            if (payload.max_trades !== undefined) {
+                payload.max_trades_per_day = payload.max_trades;
+                delete payload.max_trades;
+            }
+
+            if (updates.scan_mode) {
+                payload.is_auto_active = updates.scan_mode !== 'OFF';
+            }
+
+            if (existing) {
+                const { data, error } = await supabase
+                    .from('auto_settings')
+                    .update(payload)
+                    .eq('user_id', userId)
+                    .select()
+                    .single();
+                if (error) throw error;
+                return data;
+            } else {
+                const { data, error } = await supabase
+                    .from('auto_settings')
+                    .insert([payload])
+                    .select()
+                    .single();
+                if (error) throw error;
+                return data;
+            }
+        } catch (e) {
+            console.error('updateSettings Error:', e.message);
+            throw e;
+        }
+    }
+
+    // --- BROKER CREDENTIALS ---
+    
+    async getBrokerCredentials(userId) {
+        try {
+            const { data, error } = await supabase
+                .from('broker_credentials')
+                .select('*')
+                .eq('user_id', userId)
+                .eq('broker', 'ANGEL_ONE')
+                .single();
+            if (error && error.code !== 'PGRST116') throw error;
+            return data || null;
+        } catch (e) {
+            console.error('getBrokerCredentials Error:', e.message);
+            return null;
+        }
+    }
+
+    async updateBrokerCredentials(userId, creds) {
+        try {
+            const payload = {
+                user_id: userId,
+                broker: 'ANGEL_ONE',
+                client_id: creds.client_id,
+                password: creds.password,
+                totp_secret: creds.totp_secret,
+                api_key: creds.api_key,
+                angel_secret: creds.angel_secret,
+                telegram_bot_token: creds.telegram_bot_token || null,
+                telegram_chat_id: creds.telegram_chat_id || null,
+                updated_at: new Date().toISOString()
+            };
+
+            const { data: existing } = await supabase
+                .from('broker_credentials')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('broker', 'ANGEL_ONE')
+                .single();
+
+            if (existing) {
+                const { data, error } = await supabase
+                    .from('broker_credentials')
+                    .update(payload)
+                    .eq('id', existing.id)
+                    .select()
+                    .single();
+                if (error) throw error;
+                return data;
+            } else {
+                const { data, error } = await supabase
+                    .from('broker_credentials')
+                    .insert([payload])
+                    .select()
+                    .single();
+                if (error) throw error;
+                return data;
+            }
+        } catch (e) {
+            console.error('updateBrokerCredentials Error:', e.message);
+            throw e;
+        }
+    }
 }
+
 
 module.exports = new SupabaseService();

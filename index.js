@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const angelOneService = require('./angelOneService');
@@ -13,25 +14,102 @@ const ta = require('./technicalAnalysis');
 
 const app = express();
 const server = http.createServer(app);
+const allowedOrigins = (process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || 'http://localhost:5173,https://ai-trading-t3yo.onrender.com')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+    cors: { origin: allowedOrigins, methods: ["GET", "POST"] }
 });
 
-app.use(cors());
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        return callback(new Error('Origin not allowed by CORS'));
+    }
+}));
 app.use(bodyParser.json());
 
 // Expose io to services
 global.io = io;
 
-// Helper to get the primary user (First one in DB)
-async function getSystemUser() {
-    // 1. Try to get auto-active user first
-    const activeUsers = await supabaseService.getAutoEnabledUsers();
-    if (activeUsers.length > 0) return activeUsers[0].user_id;
+function normalizeEmail(email) {
+    return String(email || '').trim().toLowerCase();
+}
 
-    // 2. Fallback: Get ANY user from auto_settings if none are active
-    const { data } = await supabaseService.supabase.from('auto_settings').select('user_id').limit(1);
-    return (data && data.length > 0) ? data[0].user_id : null;
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+    const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    return { salt, hash };
+}
+
+function verifyPassword(password, salt, expectedHash) {
+    const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expectedHash, 'hex'));
+}
+
+function generateSessionToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+function sha256(value) {
+    return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function getAdminEmails() {
+    return (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '')
+        .split(',')
+        .map(email => normalizeEmail(email))
+        .filter(Boolean);
+}
+
+async function authenticateRequest(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization || '';
+        if (!authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
+        const token = authHeader.slice(7).trim();
+        if (!token) {
+            return res.status(401).json({ error: 'Authentication token missing' });
+        }
+
+        const tokenHash = sha256(token);
+        const session = await supabaseService.getSession(tokenHash);
+        if (!session) {
+            return res.status(401).json({ error: 'Invalid session' });
+        }
+
+        if (session.expires_at && new Date(session.expires_at) < new Date()) {
+            await supabaseService.deleteSession(tokenHash);
+            return res.status(401).json({ error: 'Session expired' });
+        }
+
+        const user = await supabaseService.getUserById(session.user_id);
+        if (!user) {
+            return res.status(401).json({ error: 'User not found' });
+        }
+
+        req.user = {
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            role: user.role || 'USER'
+        };
+        req.sessionTokenHash = tokenHash;
+        next();
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+}
+
+function requireAdmin(req, res, next) {
+    if (!req.user || req.user.role !== 'ADMIN') {
+        return res.status(403).json({ error: 'Admin access denied' });
+    }
+    next();
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -39,6 +117,104 @@ async function getSystemUser() {
 // ────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.send('StocksPro Backend Live 🚀'));
+
+app.post('/auth/register', async (req, res) => {
+    try {
+        const name = String(req.body?.name || '').trim();
+        const email = normalizeEmail(req.body?.email);
+        const password = String(req.body?.password || '');
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ error: 'Name, email, password are required' });
+        }
+
+        if (password.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        }
+
+        const existing = await supabaseService.getUserByEmail(email);
+        if (existing) {
+            return res.status(409).json({ error: 'User already exists' });
+        }
+
+        const { salt, hash } = hashPassword(password);
+        const role = getAdminEmails().includes(email) ? 'ADMIN' : 'USER';
+
+        const user = await supabaseService.createUser({
+            id: crypto.randomUUID(),
+            name,
+            email,
+            password_salt: salt,
+            password_hash: hash,
+            role,
+            created_at: new Date().toISOString()
+        });
+
+        const token = generateSessionToken();
+        await supabaseService.createSession({
+            id: crypto.randomUUID(),
+            user_id: user.id,
+            token_hash: sha256(token),
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+        });
+
+        res.json({ token, user });
+    } catch (error) {
+        console.error('[AUTH ERROR] Register failed:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/auth/login', async (req, res) => {
+    try {
+        const email = normalizeEmail(req.body?.email);
+        const password = String(req.body?.password || '');
+
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+
+        const user = await supabaseService.getUserByEmail(email);
+        if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = generateSessionToken();
+        await supabaseService.createSession({
+            id: crypto.randomUUID(),
+            user_id: user.id,
+            token_hash: sha256(token),
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+        });
+
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role || 'USER'
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/auth/me', authenticateRequest, async (req, res) => {
+    res.json({ user: req.user });
+});
+
+app.post('/auth/logout', authenticateRequest, async (req, res) => {
+    try {
+        await supabaseService.deleteSession(req.sessionTokenHash);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 app.get('/market/search', async (req, res) => {
     const { query } = req.query;
@@ -61,9 +237,11 @@ app.get('/search', async (req, res) => {
     }
 });
 
+app.use(authenticateRequest);
+
 app.get('/watchlist', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) return res.json([]);
         const list = await supabaseService.getUserWatchlist(userId);
         res.json(list);
@@ -75,7 +253,7 @@ app.get('/watchlist', async (req, res) => {
 app.post('/watchlist', async (req, res) => {
     const { symbol } = req.body;
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) throw new Error('No user found in DB');
         await supabaseService.addToWatchlist(userId, symbol.toUpperCase());
         res.json({ success: true });
@@ -86,7 +264,7 @@ app.post('/watchlist', async (req, res) => {
 
 app.delete('/watchlist/:symbol', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) throw new Error('No user found in DB');
         await supabaseService.removeFromWatchlist(userId, req.params.symbol.toUpperCase());
         res.json({ success: true });
@@ -97,7 +275,7 @@ app.delete('/watchlist/:symbol', async (req, res) => {
 
 app.get('/trades', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) return res.json([]);
         const trades = await supabaseService.getUserTrades(userId);
         res.json(trades);
@@ -108,7 +286,7 @@ app.get('/trades', async (req, res) => {
 
 app.get('/wallet', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) return res.json({ balance: 0, mode: 'PAPER' });
         
         const settings = await supabaseService.getUserSettings(userId);
@@ -131,7 +309,7 @@ app.get('/wallet', async (req, res) => {
 app.get('/balances', async (req, res) => {
     console.log(`[API] GET /balances requested...`);
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) return res.json({ real: 0, paper: 100000 });
         
         const settings = await supabaseService.getUserSettings(userId);
@@ -147,7 +325,33 @@ app.get('/balances', async (req, res) => {
         // Fetch Paper
         paper = await supabaseService.getPaperFunds(userId);
         
-        res.json({ real, paper, mode });
+        // Fetch Invested
+        const invested = await supabaseService.getInvestedCapitalAmount(userId, mode);
+        
+        res.json({ 
+            real, 
+            paper, 
+            mode,
+            invested,
+            totalEquity: (mode === 'REAL' ? real : paper) + invested
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/wallet/logs', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { data, error } = await supabaseService.supabase
+            .from('wallet_logs')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(50);
+
+        if (error) throw error;
+        res.json(data || []);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -155,7 +359,7 @@ app.get('/balances', async (req, res) => {
 
 app.get('/settings', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) return res.status(404).json({ error: 'No user found' });
         const settings = await supabaseService.getUserSettings(userId);
         res.json(settings);
@@ -166,7 +370,7 @@ app.get('/settings', async (req, res) => {
 
 app.post('/settings', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) throw new Error('No user found in DB');
         // FIX: Using correct method name 'updateSettings'
         await supabaseService.updateSettings(userId, req.body);
@@ -177,13 +381,58 @@ app.post('/settings', async (req, res) => {
     }
 });
 
+app.get('/profile/broker', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        if (!userId) return res.status(404).json({ error: 'No user found' });
+        const creds = await supabaseService.getBrokerCredentials(userId);
+        res.json(creds || {});
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/profile/broker/rms', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        if (!userId) return res.status(404).json({ error: 'No user found' });
+        
+        const creds = await supabaseService.getBrokerCredentials(userId);
+        if (!creds || !creds.api_key) return res.json({ availableCash: 0 });
+
+        const rms = await angelOneService.getUserRMSBalance(creds);
+        res.json({ availableCash: rms?.net || 0 });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/profile/broker', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        if (!userId) throw new Error('No user found in DB');
+        
+        const updates = req.body;
+        if (!updates.client_id || !updates.password || !updates.totp_secret || !updates.api_key) {
+            return res.status(400).json({ error: 'All broker fields are required' });
+        }
+
+        const creds = await supabaseService.updateBrokerCredentials(userId, updates);
+        res.json({ success: true, credentials: creds });
+    } catch (error) {
+        console.error('[BROKER CREDENTIALS POST ERROR]:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/history', async (req, res) => {
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) return res.json([]);
         const { data, error } = await supabaseService.supabase
             .from('trades')
             .select('*')
+            .eq('user_id', userId)
             .order('created_at', { ascending: false });
         
         if (error) throw error;
@@ -193,7 +442,7 @@ app.get('/history', async (req, res) => {
     }
 });
 
-app.get('/logs', async (req, res) => {
+app.get('/logs', requireAdmin, async (req, res) => {
     console.log(`[API] GET /logs requested...`);
     try {
         const limit = parseInt(req.query.limit) || 20;
@@ -206,10 +455,177 @@ app.get('/logs', async (req, res) => {
     }
 });
 
+app.get('/payment-config', async (req, res) => {
+    res.json({
+        upiId: process.env.PAYMENT_UPI_ID || '',
+        payeeName: process.env.PAYMENT_PAYEE_NAME || 'Stocks Pro',
+        qrUrl: process.env.PAYMENT_QR_URL || '',
+        instructions: process.env.PAYMENT_INSTRUCTIONS || 'QR scan pannitu transaction ID submit pannunga. Admin verify pannitu wallet credit pannuvanga.'
+    });
+});
+
+app.get('/payments/mine', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        if (!userId) return res.json([]);
+        const payments = await supabaseService.getPaymentRequests({
+            userId,
+            limit: 20
+        });
+        res.json(payments);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/payments/request', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        if (!userId) throw new Error('No user found in DB');
+
+        const payment = await supabaseService.createPaymentRequest(userId, req.body);
+        res.json({ success: true, payment });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/admin/payments', requireAdmin, async (req, res) => {
+    try {
+        const status = req.query.status ? String(req.query.status) : null;
+        const payments = await supabaseService.getPaymentRequests({
+            status,
+            limit: 100
+        });
+        res.json(payments);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/admin/payments/:id/approve', requireAdmin, async (req, res) => {
+    try {
+        const payment = await supabaseService.approvePaymentRequest(req.params.id, {
+            approvedBy: req.user.email,
+            adminNote: req.body?.admin_note || null
+        });
+        res.json({ success: true, payment });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/admin/payments/:id/reject', requireAdmin, async (req, res) => {
+    try {
+        const payment = await supabaseService.rejectPaymentRequest(req.params.id, {
+            approvedBy: req.user.email,
+            adminNote: req.body?.admin_note || null
+        });
+        res.json({ success: true, payment });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/admin/stats', requireAdmin, async (req, res) => {
+    try {
+        const [users, trades, payments, funds] = await Promise.all([
+            supabaseService.supabase.from('app_users').select('id', { count: 'exact', head: true }),
+            supabaseService.supabase.from('trades').select('status, type, entry_price, exit_price, quantity'),
+            supabaseService.supabase.from('payment_requests').select('status', { count: 'exact', head: true }).eq('status', 'PENDING'),
+            supabaseService.supabase.from('paper_funds').select('balance')
+        ]);
+
+        const allTrades = trades.data || [];
+        const closedTrades = allTrades.filter(t => t.status === 'CLOSED');
+        
+        let totalPnl = 0;
+        closedTrades.forEach(t => {
+            const pnl = (t.exit_price - t.entry_price) * (t.type === 'BUY' ? 1 : -1) * (t.quantity || 1);
+            totalPnl += pnl;
+        });
+
+        res.json({
+            totalUsers: users.count || 0,
+            activeTrades: allTrades.filter(t => t.status === 'OPEN').length,
+            pendingPayments: payments.count || 0,
+            totalSystemBalance: (funds.data || []).reduce((acc, f) => acc + Number(f.balance), 0),
+            totalClosedTrades: closedTrades.length,
+            systemWinRate: closedTrades.length > 0 
+                ? (closedTrades.filter(t => (t.exit_price - t.entry_price) * (t.type === 'BUY' ? 1 : -1) > 0).length / closedTrades.length * 100).toFixed(1)
+                : 0,
+            totalNetPnl: totalPnl.toFixed(2)
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/trade/manual', async (req, res) => {
+    const { symbol, price, type, quantity = 1 } = req.body;
+    console.log(`[TRADE] Manual trade request: ${type} ${symbol} @ ${price}`);
+    try {
+        const userId = req.user.id;
+        if (!userId) throw new Error('No user found');
+        if (!symbol) throw new Error('Symbol is required');
+        if (!type || !['BUY', 'SELL'].includes(type.toUpperCase())) throw new Error('type must be BUY or SELL');
+        if (!price || isNaN(price)) throw new Error('Valid price is required');
+
+        const settings = await supabaseService.getUserSettings(userId);
+        const mode = settings.trade_mode || 'PAPER';
+        const tradeType = type.toUpperCase();
+        const entryPrice = parseFloat(price);
+        const qty = parseInt(quantity) || 1;
+        const tradeValue = entryPrice * qty;
+
+        // Deduct paper funds if PAPER mode
+        if (mode === 'PAPER') {
+            const balance = await supabaseService.getPaperFunds(userId);
+            if (balance < tradeValue) {
+                return res.status(400).json({ error: `Insufficient paper funds. Balance: ₹${balance.toFixed(2)}, Required: ₹${tradeValue.toFixed(2)}` });
+            }
+            await supabaseService.deductPaperFunds(userId, tradeValue, 'TRADE_OPEN', null);
+        }
+
+        // Insert trade record
+        const { data: trade, error: insertError } = await supabaseService.supabase
+            .from('trades')
+            .insert([{
+                user_id: userId,
+                symbol: symbol.toUpperCase(),
+                type: tradeType,
+                side: mode === 'REAL' ? 'REAL' : 'PAPER',
+                entry_price: entryPrice,
+                quantity: qty,
+                status: 'OPEN',
+                created_at: new Date().toISOString()
+            }])
+            .select()
+            .single();
+
+        if (insertError) throw insertError;
+
+        console.log(`[TRADE] Manual trade opened: ${tradeType} ${symbol} @ ${entryPrice} ✅`);
+        res.json({ success: true, trade });
+    } catch (error) {
+        console.error(`[TRADE] Manual open error:`, error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Alias
+app.post('/trade/open', async (req, res) => {
+    req.url = '/trade/manual';
+    app.handle(req, res);
+});
+
+
 app.post('/trade/close', async (req, res) => {
     const { tradeId } = req.body;
     console.log(`[TRADE] Request to close trade: ${tradeId}`);
     try {
+        const userId = req.user.id;
+
         // 1. Get trade details from Supabase
         const { data: trade, error } = await supabaseService.supabase
             .from('trades')
@@ -219,6 +635,7 @@ app.post('/trade/close', async (req, res) => {
 
         if (error || !trade) throw new Error('Trade not found');
         if (trade.status === 'CLOSED') throw new Error('Trade already closed');
+        if (userId && trade.user_id !== userId) throw new Error('Trade does not belong to the active user');
 
         const isReal = trade.side.includes('REAL');
         const symbol = trade.symbol;
@@ -233,7 +650,14 @@ app.post('/trade/close', async (req, res) => {
             const quote = await angelOneService.getQuote(symbol);
             exitPrice = quote.lastTradedPrice;
 
-            await angelOneService.placeOrder(
+            // Fetch per-user broker credentials
+            const creds = await supabaseService.getBrokerCredentials(userId);
+            if (!creds || !creds.api_key) {
+                throw new Error('Broker credentials not configured for this user.');
+            }
+
+            await angelOneService.placeUserOrder(
+                creds,
                 symbol,
                 quote.symbolToken,
                 quantity,
@@ -252,6 +676,7 @@ app.post('/trade/close', async (req, res) => {
         }
 
         // 3. Update Supabase record
+        console.log(`[TRADE] Updating trade ${tradeId} status to CLOSED...`);
         const { error: updateError } = await supabaseService.supabase
             .from('trades')
             .update({
@@ -261,15 +686,20 @@ app.post('/trade/close', async (req, res) => {
             })
             .eq('id', tradeId);
 
-        if (updateError) throw updateError;
+        if (updateError) {
+            console.error(`[TRADE] Update Error:`, updateError.message);
+            throw updateError;
+        }
 
         // 4. If Paper, credit funds back to wallet
-        if (!isReal) {
+        console.log(`[TRADE] Trade side: ${trade.side}, isReal: ${isReal}`);
+        if (trade.side === 'PAPER') {
             console.log(`[PAPER] Crediting funds back for ${symbol}...`);
             const pnl = (exitPrice - trade.entry_price) * (trade.type === 'BUY' ? 1 : -1) * quantity;
             const amountToCredit = (trade.entry_price * quantity) + pnl;
             
-            await supabaseService.creditPaperFunds(trade.user_id, amountToCredit);
+            console.log(`[PAPER] PnL: ${pnl}, Amount to Credit: ${amountToCredit}`);
+            await supabaseService.creditPaperFunds(trade.user_id, amountToCredit, 'TRADE_EXIT', trade.id);
             console.log(`[PAPER] Credited ₹${amountToCredit.toFixed(2)} to wallet ✅`);
         }
 
@@ -320,7 +750,7 @@ app.post('/analyze', async (req, res) => {
 app.post('/trade/manual', async (req, res) => {
     const { symbol, side, price } = req.body;
     try {
-        const userId = await getSystemUser();
+        const userId = req.user.id;
         if (!userId) throw new Error('No user found');
 
         await angelOneService.loadSymbolMaster();
@@ -366,7 +796,7 @@ app.post('/trade/manual', async (req, res) => {
             expected_duration: req.body.expectedDuration || null
         });
 
-        if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL' });
+        if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL', userId });
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
