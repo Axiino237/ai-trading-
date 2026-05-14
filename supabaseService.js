@@ -114,6 +114,56 @@ class SupabaseService {
             return [{ symbol: 'RELIANCE' }, { symbol: 'TATASTEEL' }, { symbol: 'SBIN' }];
         }
     }
+
+    /**
+     * Add symbol to user's watchlist
+     */
+    async addToWatchlist(userId, symbol) {
+        try {
+            const { data: existing } = await supabase
+                .from('watchlist')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('symbol', symbol)
+                .single();
+            
+            if (existing) return { success: true };
+
+            const { error } = await supabase
+                .from('watchlist')
+                .insert([{ 
+                    user_id: userId, 
+                    symbol: symbol,
+                    asset_type: 'EQUITY',
+                    created_at: new Date().toISOString()
+                }]);
+            
+            if (error) throw error;
+            return { success: true };
+        } catch (error) {
+            console.error('Add to watchlist error:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Remove symbol from user's watchlist
+     */
+    async removeFromWatchlist(userId, symbol) {
+        try {
+            const { error } = await supabase
+                .from('watchlist')
+                .delete()
+                .eq('user_id', userId)
+                .eq('symbol', symbol);
+            
+            if (error) throw error;
+            return { success: true };
+        } catch (error) {
+            console.error('Remove from watchlist error:', error.message);
+            throw error;
+        }
+    }
     /**
      * Get paper trading balance for a user
      */
