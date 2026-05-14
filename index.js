@@ -180,9 +180,13 @@ app.get('/history', async (req, res) => {
     try {
         const userId = await getSystemUser();
         if (!userId) return res.json([]);
-        const settings = await supabaseService.getUserSettings(userId);
-        const history = await supabaseService.getHistory(settings.trade_mode || 'PAPER');
-        res.json(history);
+        const { data, error } = await supabaseService.supabase
+            .from('trades')
+            .select('*')
+            .order('created_at', { ascending: false });
+        
+        if (error) throw error;
+        res.json(data || []);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
