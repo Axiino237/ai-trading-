@@ -39,6 +39,8 @@ class SupabaseService {
                     take_profit: tradeData.take_profit,
                     quantity: tradeData.quantity || 1,
                     trade_mode: tradeData.trade_mode || 'BOT', // 'BOT' or 'MANUAL'
+                    holding_type: tradeData.holding_type || 'SHORT_TERM',
+                    expected_duration: tradeData.expected_duration || null,
                     status: 'OPEN',
                     created_at: new Date().toISOString()
                 }]);
@@ -223,12 +225,21 @@ class SupabaseService {
                 auto_trade_on: data ? (data.is_auto_active || false) : false,
                 trade_mode: data ? (data.trade_mode || 'PAPER') : 'PAPER',
                 scan_mode: data ? (data.scan_mode || 'STRICT') : 'STRICT',
-                risk_per_trade: data ? (data.risk_per_trade || 1) : 1
+                risk_per_trade: data ? (data.risk_per_trade || 1) : 1,
+                // NEW RISK PARAMS
+                max_utilization_pct: data ? (data.max_utilization_pct || 60) : 60,
+                min_allocation_pct: data ? (data.min_allocation_pct || 10) : 10,
+                max_allocation_pct: data ? (data.max_allocation_pct || 20) : 20,
+                short_term_ratio: data ? (data.short_term_ratio || 70) : 70,
+                ai_confidence_threshold: data ? (data.ai_confidence_threshold || 70) : 70
             };
             console.log(`[SETTINGS] Loaded:`, JSON.stringify(finalSettings));
             return finalSettings;
         } catch (error) {
-            return { user_id: userId, daily_trade_limit: 5, auto_trade_on: false, trade_mode: 'PAPER', scan_mode: 'STRICT' };
+            return { 
+                user_id: userId, daily_trade_limit: 5, auto_trade_on: false, trade_mode: 'PAPER', scan_mode: 'STRICT',
+                max_utilization_pct: 60, min_allocation_pct: 10, max_allocation_pct: 20, short_term_ratio: 70, ai_confidence_threshold: 70
+            };
         }
     }
 
@@ -271,7 +282,13 @@ class SupabaseService {
                 max_trades_per_day: dailyLimit !== undefined ? parseInt(dailyLimit) : (current ? current.max_trades_per_day : 5),
                 scan_mode: updates.scan_mode || (current ? current.scan_mode : 'STRICT'),
                 risk_per_trade: updates.risk_per_trade !== undefined ? updates.risk_per_trade : (current ? current.risk_per_trade : 1),
-                trade_mode: tradeMode
+                trade_mode: tradeMode,
+                // NEW RISK PARAMS
+                max_utilization_pct: updates.max_utilization_pct !== undefined ? updates.max_utilization_pct : (current ? current.max_utilization_pct : 60),
+                min_allocation_pct: updates.min_allocation_pct !== undefined ? updates.min_allocation_pct : (current ? current.min_allocation_pct : 10),
+                max_allocation_pct: updates.max_allocation_pct !== undefined ? updates.max_allocation_pct : (current ? current.max_allocation_pct : 20),
+                short_term_ratio: updates.short_term_ratio !== undefined ? updates.short_term_ratio : (current ? current.short_term_ratio : 70),
+                ai_confidence_threshold: updates.ai_confidence_threshold !== undefined ? updates.ai_confidence_threshold : (current ? current.ai_confidence_threshold : 70)
             };
 
             console.log(`[SETTINGS] Upserting to DB:`, JSON.stringify(dbSettings));
@@ -346,6 +363,55 @@ class SupabaseService {
             }
         } catch (e) {
             console.error('[DB MAINTENANCE ERROR] Failed to clean up old logs:', e.message);
+        }
+    }
+
+    /**
+     * Get Total Invested Capital for open positions
+     */
+    async getInvestedCapital(userId, tradingMode) {
+        try {
+            const { data, error } = await supabase
+                .from('trades')
+                .select('entry_price, quantity')
+                .eq('user_id', userId)
+                .eq('status', 'OPEN')
+                .ilike('side', `%_${tradingMode}`);
+
+            if (error) throw error;
+            
+            const total = data.reduce((acc, trade) => {
+                return acc + (trade.entry_price * (trade.quantity || 1));
+            }, 0);
+            
+            return total;
+        } catch (error) {
+            console.error('[SUPABASE] Invested Capital Error:', error.message);
+            return 0;
+        }
+    }
+
+    /**
+     * Get counts for trade types to maintain ratio
+     */
+    async getTradeTypeCounts(userId) {
+        try {
+            const { data, error } = await supabase
+                .from('trades')
+                .select('holding_type')
+                .eq('user_id', userId)
+                .eq('status', 'OPEN');
+
+            if (error) throw error;
+
+            const counts = { SHORT_TERM: 0, LONG_TERM: 0 };
+            data.forEach(t => {
+                if (t.holding_type === 'LONG_TERM') counts.LONG_TERM++;
+                else counts.SHORT_TERM++;
+            });
+            return counts;
+        } catch (error) {
+            return { SHORT_TERM: 0, LONG_TERM: 0 };
         }
     }
 }

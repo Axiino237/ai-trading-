@@ -11,7 +11,21 @@ class ScannerService {
     constructor() {
         this.interval = 5 * 60 * 1000; // 5 min scan
         this.isScanning = false;
-        this.broadcasterInterval = 15 * 1000; // 15 sec price update (Slower for rate limit safety)
+        this.broadcasterInterval = 15 * 1000; // 15 sec price update
+        this.marketOpenTime = "09:15";
+        this.marketCloseTime = "15:30";
+    }
+
+    isMarketOpen() {
+        const now = new Date();
+        const day = now.getDay();
+        const time = now.getHours().toString().padStart(2, '0') + ":" + now.getMinutes().toString().padStart(2, '0');
+
+        // Monday to Friday only
+        if (day === 0 || day === 6) return false;
+        
+        // Between 9:15 and 15:30
+        return time >= this.marketOpenTime && time <= this.marketCloseTime;
     }
 
     start() {
@@ -21,12 +35,11 @@ class ScannerService {
     }
 
     startBroadcaster() {
-        setInterval(async () => {
+        const run = async () => {
             try {
                 const defaultSymbols = ['RELIANCE-EQ', 'TATASTEEL-EQ', 'SBIN-EQ', 'HDFCBANK-EQ', 'INFY-EQ'];
-                const MOCK_USER_ID = '550e8400-e29b-41d4-a716-446655440000'; // Matches auto_settings
+                const MOCK_USER_ID = '550e8400-e29b-41d4-a716-446655440000';
                 
-                // Always fetch mock user watchlist for live updates
                 const list = await supabaseService.getUserWatchlist(MOCK_USER_ID);
                 const userSymbols = list.map(item => item.symbol);
 
@@ -39,21 +52,24 @@ class ScannerService {
                             symbol: quote.tradingSymbol, 
                             price: quote.lastTradedPrice,
                             change: (quote.pChange || quote.percentChange || (quote.close ? ((quote.ltp - quote.close) / quote.close * 100).toFixed(2) : '0')) + '%'
-                            // Omit 'pass' to avoid overwriting scanner signals
                         });
-                        console.log(`[BROADCAST] Sent live price for ${quote.tradingSymbol}: ₹${quote.lastTradedPrice}`);
                     }
                 }
-                // Wait longer between batches to stay safe
-                await new Promise(r => setTimeout(r, 5000));
             } catch (e) {
-                // Global broadcaster fail
+                console.error('[BROADCASTER ERROR]:', e.message);
             }
-        }, this.broadcasterInterval);
+            // Recursive call for safety instead of setInterval
+            setTimeout(run, this.broadcasterInterval);
+        };
+        run();
     }
 
     async safeScan() {
-        await this.scan();
+        if (this.isMarketOpen()) {
+            await this.scan();
+        } else {
+            console.log(`[SCANNER] Market is CLOSED (${new Date().toLocaleTimeString()}). Sleeping... 😴`);
+        }
         setTimeout(() => this.safeScan(), this.interval);
     }
 
@@ -148,22 +164,6 @@ class ScannerService {
 
             logger.success(`[SCANNER] ${symbol} PASSED Technical Check! ✅`, { side: rules.side, rsi: indicators.rsi });
 
-            // Send Telegram Notification (Signal Found)
-            const tradingMode = (await supabaseService.getUserSettings(userId)).trade_mode || 'PAPER';
-            await telegramService.sendTradeAlert({
-                symbol,
-                side: rules.side,
-                price: quote.lastTradedPrice,
-                action: 'SIGNAL',
-                tradeMode: tradingMode,
-                indicators: {
-                    rsi: indicators.rsi,
-                    ema9: indicators.ema9,
-                    ema20: indicators.ema20,
-                    macd: indicators.macd,
-                    trend: indicators.ema9 > indicators.ema20 ? '📈 BULLISH' : '📉 BEARISH'
-                }
-            });
 
             if (!settings.auto_trade_on) {
                 logger.info(`[SCANNER] Automation OFF for User. Skipping AI Analysis for ${symbol}.`);
@@ -176,17 +176,54 @@ class ScannerService {
                 logger.warn(`[SCANNER] Daily trade limit reached. Skipping AI for ${symbol}.`);
                 return;
             }
+            // PRE-AI CAPACITY CHECK (Cost Optimization)
+            const investedCapital = await supabaseService.getInvestedCapital(userId, tradingMode);
+            const totalFundsAvailable = (tradingMode === 'REAL') 
+                ? parseFloat((await angelOneService.getRMSBalance())?.net || 0)
+                : await supabaseService.getPaperFunds(userId);
+            
+            const totalCapacity = totalFundsAvailable + investedCapital;
+            const maxUtilization = settings.max_utilization_pct || 60;
+            const currentUtilPct = totalCapacity > 0 ? (investedCapital / totalCapacity) * 100 : 0;
+
+            if (currentUtilPct >= maxUtilization) {
+                // EXCEPTION: Only proceed to AI if the technical setup is extremely strong (STRICT)
+                const strictCheck = ta.checkRules(indicators, 'STRICT');
+                if (!strictCheck.pass) {
+                    logger.info(`[SCANNER] ${symbol} Utilization at ${currentUtilPct.toFixed(1)}%. Skipping AI as setup is not 'STRICT' quality.`);
+                    return;
+                }
+                logger.info(`[SCANNER] ${symbol} Utilization at ${currentUtilPct.toFixed(1)}%, but setup is STRICT quality. Proceeding to AI for high-probability check.`);
+            }
 
             // AI Analysis
             const aiResult = await this.getAIAnalysis(symbol, quote.lastTradedPrice, indicators);
-            if (aiResult.sentiment === 'NEUTRAL' || aiResult.confidenceScore < 70) {
-                logger.info(`[SCANNER] AI Analysis weak for ${symbol}: ${aiResult.sentiment} (${aiResult.confidenceScore}). Skipping.`);
+            
+            // Check configurable confidence threshold
+            const confidenceThreshold = settings.ai_confidence_threshold || 70;
+            if (aiResult.sentiment === 'NEUTRAL' || aiResult.confidenceScore < confidenceThreshold) {
+                logger.info(`[SCANNER] AI Analysis weak for ${symbol}: ${aiResult.sentiment} (${aiResult.confidenceScore} < ${confidenceThreshold}). Skipping.`);
                 return;
             }
 
+            // NEW: Determine Trade Type (SHORT vs LONG) based on current ratio
+            const counts = await supabaseService.getTradeTypeCounts(userId);
+            const totalActive = counts.SHORT_TERM + counts.LONG_TERM;
+            const targetShortRatio = settings.short_term_ratio || 70;
+            
+            let holdingType = 'SHORT_TERM';
+            if (totalActive > 0) {
+                const currentShortRatio = (counts.SHORT_TERM / totalActive) * 100;
+                if (currentShortRatio > targetShortRatio) {
+                    holdingType = 'LONG_TERM';
+                }
+            }
+            
+            logger.info(`[SCANNER] Selected Holding Type: ${holdingType} (Current Short Ratio: ${totalActive === 0 ? 100 : (counts.SHORT_TERM/totalActive*100).toFixed(1)}%)`);
+
             const risk = this.calculateRisk(quote.lastTradedPrice, aiResult.sentiment);
             
-            // NEW: Calculate dynamic quantity based on Risk management
+            // NEW: Calculate dynamic quantity based on Advanced Risk management
             const quantity = await this.calculateQuantity(userId, quote.lastTradedPrice, risk.sl, tradingMode);
 
             // Send Telegram Notification (Execution)
@@ -200,13 +237,15 @@ class ScannerService {
                     quantity: quantity,
                     confidence: aiResult.confidenceScore,
                     action: 'EXECUTION',
-                    tradeMode: tradingMode
+                    tradeMode: tradingMode,
+                    holdingType: holdingType,
+                    expectedDuration: aiResult.suggestedHolding || 'N/A'
                 });
 
                 console.log(`[EXECUTION] Placing ${aiResult.sentiment} order for ${symbol} (Qty: ${quantity})... 💰`);
-                await this.executeTrade(userId, symbol, quote.symbolToken, aiResult.sentiment, risk, quantity);
+                await this.executeTrade(userId, symbol, quote.symbolToken, aiResult.sentiment, risk, quantity, holdingType, aiResult.suggestedHolding);
             } else {
-                console.log(`[EXECUTION SKIPPED] ${symbol} - Insufficient capital for 1 share.`);
+                console.log(`[EXECUTION SKIPPED] ${symbol} - Insufficient capital or risk limit reached.`);
             }
 
         } catch (error) {
@@ -220,16 +259,23 @@ class ScannerService {
             SYMBOL: ${symbol} @ ₹${price}
             INDICATORS: RSI: ${indicators.rsi.toFixed(2)}, MACD Histogram: ${indicators.macd.histogram.toFixed(2)}, EMA Trend: ${indicators.ema9 > indicators.ema50 ? 'Bullish' : 'Bearish'}
             TASK: Compare with 2-year historical setups. Detect false breakouts.
-            OUTPUT JSON: {"sentiment": "BUY", "confidenceScore": 92, "riskLevel": "Low", "suggestedHolding": "2 days", "winProbability": 88}
+            OUTPUT JSON: {"sentiment": "BUY", "confidenceScore": 92, "riskLevel": "Low", "suggestedHolding": "2 days", "winProbability": 88, "holdingType": "SHORT_TERM"}
         `;
         try {
             const text = await geminiService.generateAnalysis(prompt);
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (!jsonMatch) throw new Error('AI failed to return valid JSON');
-            return JSON.parse(jsonMatch[0]);
+            const result = JSON.parse(jsonMatch[0]);
+            
+            // Calculate SL/TP automatically if not provided by AI
+            const risk = this.calculateRisk(price, result.sentiment);
+            result.sl = risk.sl;
+            result.tp = risk.tp;
+            
+            return result;
         } catch (e) {
             console.error('[AI ENGINE ERROR]:', e.message);
-            return { sentiment: 'NEUTRAL', confidenceScore: 0 };
+            return { sentiment: 'NEUTRAL', confidenceScore: 0, holdingType: 'SHORT_TERM' };
         }
     }
 
@@ -251,7 +297,7 @@ class ScannerService {
 
     async calculateQuantity(userId, entryPrice, slPrice, tradingMode) {
         try {
-            // 1. Get Capital
+            // 1. Get Capital & Settings
             let capital = 100000; // Default
             if (tradingMode === 'REAL') {
                 const balance = await angelOneService.getRMSBalance();
@@ -260,36 +306,72 @@ class ScannerService {
                 capital = await supabaseService.getPaperFunds(userId);
             }
 
-            // 2. Get Risk % from Settings
             const settings = await supabaseService.getUserSettings(userId);
-            const riskPct = settings.risk_per_trade || 1; // Default 1% risk
+            
+            // 2. UTILIZATION CHECK (60% Rule)
+            const maxUtilization = settings.max_utilization_pct || 60;
+            const investedCapital = await supabaseService.getInvestedCapital(userId, tradingMode);
+            const totalCapacity = capital + investedCapital; // Total capital including current value
+            const maxAllowedToInvest = totalCapacity * (maxUtilization / 100);
+            
+            if (investedCapital >= maxAllowedToInvest) {
+                logger.warn(`[RISK] Max Utilization reached (${((investedCapital/totalCapacity)*100).toFixed(1)}% / ${maxUtilization}%). No new trades.`);
+                return 0;
+            }
 
-            // 3. Risk Amount in Rupees
-            const riskAmt = capital * (riskPct / 100);
-
-            // 4. Stop Loss Distance
+            // 3. PER-STOCK LIMIT (10-20% Rule)
+            const minAllocPct = settings.min_allocation_pct || 10;
+            const maxAllocPct = settings.max_allocation_pct || 20;
+            
+            // Target roughly middle of min/max or just min
+            const targetAllocAmt = totalCapacity * (maxAllocPct / 100);
+            
+            // 4. RISK PER TRADE (Standard SL based calculation)
+            const riskPct = settings.risk_per_trade || 1; 
+            const riskAmt = totalCapacity * (riskPct / 100);
             const slDistance = Math.abs(entryPrice - slPrice);
 
-            // 5. Quantity = Risk Amount / SL Distance
-            let qty = Math.floor(riskAmt / slDistance);
+            // Calculation A: Quantity by Risk
+            let qtyByRisk = Math.floor(riskAmt / slDistance);
 
-            console.log(`[QTY CALC] ${userId} | Capital: ${capital} | RiskAmt: ${riskAmt} | SL Dist: ${slDistance} | Final Qty: ${qty}`);
+            // Calculation B: Quantity by Allocation Limit
+            let qtyByAlloc = Math.floor(targetAllocAmt / entryPrice);
 
-            // Safety check: Don't buy more than total capital / price
-            const maxQtyByCapital = Math.floor(capital / entryPrice);
-            if (qty > maxQtyByCapital) qty = maxQtyByCapital;
+            // Final Qty is the lower of the two for safety
+            let qty = Math.min(qtyByRisk, qtyByAlloc);
 
-            // If capital is 0 or insufficient for even 1 share, return 0
+            // Safety check: Cannot exceed remaining allowed utilization
+            const remainingUtil = maxAllowedToInvest - investedCapital;
+            const maxQtyByUtil = Math.floor(remainingUtil / entryPrice);
+            if (qty > maxQtyByUtil) qty = maxQtyByUtil;
+
+            // Safety check: Ensure it meets MIN allocation (10%)
+            const minAllocAmt = totalCapacity * (minAllocPct / 100);
+            if (qty * entryPrice < minAllocAmt) {
+                // If the suggested qty is too low, we try to bump it to min allocation 
+                // BUT only if risk is still acceptable or we just return 0 to be safe
+                const qtyToMeetMin = Math.ceil(minAllocAmt / entryPrice);
+                if (qtyToMeetMin * entryPrice <= remainingUtil) {
+                    qty = qtyToMeetMin;
+                    logger.info(`[QTY] Bumping to min allocation: ${qty} shares (₹${(qty*entryPrice).toFixed(2)})`);
+                } else {
+                    logger.warn(`[QTY] Cannot meet min allocation of ${minAllocPct}% without exceeding utilization.`);
+                    return 0;
+                }
+            }
+
+            console.log(`[QTY CALC] ${userId} | TotalCap: ${totalCapacity.toFixed(0)} | RiskAmt: ${riskAmt.toFixed(0)} | TargetAlloc: ${targetAllocAmt.toFixed(0)} | Final Qty: ${qty}`);
+
             return qty > 0 ? qty : 0;
         } catch (error) {
             console.error('[QTY CALC ERROR]:', error.message);
-            return 1;
+            return 0;
         }
     }
 
-    async executeTrade(userId, symbol, token, side, risk, quantity = 1) {
+    async executeTrade(userId, symbol, token, side, risk, quantity = 1, holdingType = 'SHORT_TERM', duration = null) {
         try {
-            logger.info(`[EXECUTION START] Processing ${side} for ${symbol} (Qty: ${quantity})...`);
+            logger.info(`[EXECUTION START] Processing ${side} for ${symbol} (Qty: ${quantity}, Type: ${holdingType})...`);
             
             const settings = await supabaseService.getUserSettings(userId);
             const tradingType = settings.trade_mode || 'PAPER';
@@ -311,7 +393,9 @@ class ScannerService {
                 take_profit: risk.tp,
                 status: 'OPEN',
                 trading_type: tradingType,
-                trade_mode: 'BOT'
+                trade_mode: 'BOT',
+                holding_type: holdingType,
+                expected_duration: duration
             });
             logger.success(`[DATABASE] Trade saved successfully for ${symbol}! ✅`);
 

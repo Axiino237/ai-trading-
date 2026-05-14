@@ -138,19 +138,25 @@ class TechnicalAnalysis {
                 details: { isBuy, isSell }
             };
         } else {
-            // RELAXED MODE
+            // SMART RELAXED MODE - Optimized for Profit/Entry Balance
             const trendUp = ema9 > ema20;
             const trendDown = ema9 < ema20;
-            const volOk = volume > 1.1 * avgVolume;
-            const rsiOk = rsi > 40 && rsi < 75;
+            
+            // Check MACD Momentum (Directional)
+            const macdBullish = macd.histogram > 0;
+            const macdBearish = macd.histogram < 0;
 
-            const isBuy = (trendUp && rsiOk && volOk) || (trendUp && bullishPattern);
-            const isSell = (trendDown && rsiOk && volOk) || (trendDown && bearishPattern);
+            const volOk = volume > 1.1 * avgVolume;
+            const rsiOk = rsi > 45 && rsi < 75; // Slightly tighter for better quality
+
+            // Entry logic: Basic trend + (Either high volume OR a strong candle pattern) + MACD direction
+            const isBuy = trendUp && rsiOk && (volOk || bullishPattern) && macdBullish;
+            const isSell = trendDown && (rsi < 55 && rsi > 25) && (volOk || bearishPattern) && macdBearish;
 
             return {
                 pass: isBuy || isSell,
                 side: isBuy ? 'BUY' : (isSell ? 'SELL' : 'NONE'),
-                details: { isBuy, isSell }
+                details: { isBuy, isSell, logic: 'SMART_RELAXED' }
             };
         }
     }

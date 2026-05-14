@@ -9,6 +9,7 @@ const angelOneService = require('./angelOneService');
 const geminiService = require('./geminiService');
 const scannerService = require('./scannerService');
 const supabaseService = require('./supabaseService');
+const ta = require('./technicalAnalysis');
 
 const app = express();
 const server = http.createServer(app);
@@ -282,24 +283,36 @@ app.post('/trade/close', async (req, res) => {
 app.post('/analyze', async (req, res) => {
     const { symbol } = req.body;
     try {
-        // Mock AI Insight generation based on symbol hash for deterministic results
-        const hash = symbol.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-        const sentiment = hash % 2 === 0 ? 'BUY' : 'SELL';
-        const confidenceScore = 65 + (hash % 30); // 65% to 95%
+        console.log(`[API] AI Analysis requested for ${symbol}...`);
+        const quote = await angelOneService.getQuote(symbol);
+        const candles = await angelOneService.getCandleData(symbol, 'FIVE_MINUTE', 5);
         
-        const explanation = sentiment === 'BUY' 
-            ? `AI detects strong accumulation in ${symbol} with key moving averages crossing bullish. Volume profile supports upward continuation.`
-            : `AI detects overhead resistance and bearish divergence for ${symbol}. Momentum oscillators indicate overbought conditions.`;
+        if (!quote || !candles) throw new Error('Could not fetch market data');
 
-        // Simulate network delay for AI processing feel
-        await new Promise(r => setTimeout(r, 800));
+        const indicators = {
+            ema9: ta.calculateEMA(candles, 9),
+            ema20: ta.calculateEMA(candles, 20),
+            ema50: ta.calculateEMA(candles, 50),
+            rsi: ta.calculateRSI(candles),
+            macd: ta.calculateMACD(candles),
+            volume: quote.volume || candles[candles.length - 1][5],
+            avgVolume: ta.calculateAvgVolume(candles, 20),
+            candles: candles
+        };
+
+        const result = await scannerService.getAIAnalysis(symbol, quote.lastTradedPrice, indicators);
 
         res.json({
-            sentiment,
-            confidenceScore,
-            explanation
+            sentiment: result.sentiment,
+            confidenceScore: result.confidenceScore,
+            explanation: result.explanation || `AI analysis for ${symbol} @ ₹${quote.lastTradedPrice}`,
+            sl: result.sl,
+            tp: result.tp,
+            holdingType: result.holdingType,
+            expectedDuration: result.suggestedHolding
         });
     } catch (error) {
+        console.error('[API ANALYZE ERROR]:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -341,14 +354,16 @@ app.post('/trade/manual', async (req, res) => {
             symbol,
             symbolToken: scrip.token,
             entry_price: price,
-            stop_loss: sl,
-            take_profit: tp,
+            stop_loss: req.body.sl || sl,
+            take_profit: req.body.tp || tp,
             quantity: finalQuantity,
             side: side,
             type: side,
             status: 'OPEN',
             trade_mode: 'MANUAL',
-            trading_type: mode
+            trading_type: mode,
+            holding_type: req.body.holdingType || 'SHORT_TERM',
+            expected_duration: req.body.expectedDuration || null
         });
 
         if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL' });
