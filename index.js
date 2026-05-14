@@ -262,6 +262,16 @@ app.post('/trade/close', async (req, res) => {
 
         if (updateError) throw updateError;
 
+        // 4. If Paper, credit funds back to wallet
+        if (!isReal) {
+            console.log(`[PAPER] Crediting funds back for ${symbol}...`);
+            const pnl = (exitPrice - trade.entry_price) * (trade.type === 'BUY' ? 1 : -1) * quantity;
+            const amountToCredit = (trade.entry_price * quantity) + pnl;
+            
+            await supabaseService.creditPaperFunds(trade.user_id, amountToCredit);
+            console.log(`[PAPER] Credited ₹${amountToCredit.toFixed(2)} to wallet ✅`);
+        }
+
         res.json({ success: true, message: `Trade ${symbol} closed at ${exitPrice}` });
     } catch (error) {
         console.error(`[TRADE] Close Error:`, error.message);
