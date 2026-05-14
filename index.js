@@ -284,6 +284,63 @@ app.post('/trade/manual', async (req, res) => {
     }
 });
 
+app.post('/trade/close', async (req, res) => {
+    const { tradeId } = req.body;
+    try {
+        const trade = await supabaseService.getTradeById(tradeId);
+        if (!trade) return res.status(404).json({ error: 'Trade not found' });
+        if (trade.status === 'CLOSED') return res.status(400).json({ error: 'Trade already closed' });
+
+        const isReal = trade.side.includes('_REAL');
+        let exitPrice = 0;
+
+        // 1. Get current price
+        const quote = await angelOneService.getQuote(trade.symbol);
+        exitPrice = quote.lastTradedPrice;
+
+        if (isReal) {
+            // 2. Real mode → Place exit order on Angel One
+            const exitSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
+            const scripResults = await angelOneService.searchScrip('NSE', trade.symbol);
+            const token = scripResults.data?.[0]?.symbolToken;
+
+            await angelOneService.placeOrder(
+                trade.symbol,
+                token,
+                trade.quantity || 1,
+                exitSide,
+                'MARKET',
+                0
+            );
+            console.log(`[REAL EXIT] Market exit order placed for ${trade.symbol}`);
+        } else {
+            // 3. Paper mode → Credit funds back to paper wallet
+            const qty = trade.quantity || 1;
+            const originalCost = trade.entry_price * qty;
+            const isBuy = trade.type === 'BUY';
+            const pnl = isBuy ? (exitPrice - trade.entry_price) * qty : (trade.entry_price - exitPrice) * qty;
+            const creditAmount = originalCost + pnl;
+            
+            await supabaseService.creditPaperFunds(trade.user_id, creditAmount);
+            console.log(`[PAPER EXIT] Credited ₹${creditAmount.toFixed(2)} to wallet for ${trade.symbol}`);
+        }
+
+        // 4. Mark as CLOSED in DB
+        await supabaseService.updateTradeStatus(tradeId, {
+            status: 'CLOSED',
+            exit_price: exitPrice
+        });
+
+        // 5. Notify UI
+        if (global.io) global.io.emit('trade-executed', { symbol: trade.symbol, mode: 'EXIT' });
+
+        res.json({ success: true, exitPrice });
+    } catch (error) {
+        console.error('Close Trade Error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ────────────────────────────────────────────────────────────────
 // SERVER START
 // ────────────────────────────────────────────────────────────────
