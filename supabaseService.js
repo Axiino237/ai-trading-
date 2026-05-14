@@ -348,40 +348,6 @@ class SupabaseService {
             console.error('[DB MAINTENANCE ERROR] Failed to clean up old logs:', e.message);
         }
     }
-    async getTradeById(tradeId) {
-        try {
-            const { data, error } = await supabase
-                .from('trades')
-                .select('*')
-                .eq('id', tradeId)
-                .single();
-            if (error) throw error;
-            return data;
-        } catch (error) {
-            console.error('Fetch Trade Error:', error.message);
-            return null;
-        }
-    }
-
-    async updateTradeStatus(tradeId, updateData) {
-        try {
-            const { data, error } = await supabase
-                .from('trades')
-                .update({
-                    status: updateData.status || 'CLOSED',
-                    exit_price: updateData.exit_price,
-                    side: updateData.side, // Usually updated to include CLOSED/SETTLED status if desired
-                    closed_at: new Date().toISOString()
-                })
-                .eq('id', tradeId);
-            
-            if (error) throw error;
-            return { success: true, data };
-        } catch (error) {
-            console.error('Update Trade Error:', error.message);
-            return { success: false, error: error.message };
-        }
-    }
 }
 
 module.exports = new SupabaseService();
