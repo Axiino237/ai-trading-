@@ -14,23 +14,12 @@ const ta = require('./technicalAnalysis');
 
 const app = express();
 const server = http.createServer(app);
-const allowedOrigins = (process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || 'http://localhost:5173,https://ai-trading-t3yo.onrender.com')
-    .split(',')
-    .map(origin => origin.trim())
-    .filter(Boolean);
-const io = new Server(server, {
-    cors: { origin: allowedOrigins, methods: ["GET", "POST"] }
-});
-
-app.use(cors({
-    origin(origin, callback) {
-        if (!origin || allowedOrigins.includes(origin)) {
-            return callback(null, true);
-        }
-        return callback(new Error('Origin not allowed by CORS'));
-    }
-}));
+app.use(cors());
 app.use(bodyParser.json());
+
+const io = new Server(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+});
 
 // Expose io to services
 global.io = io;
