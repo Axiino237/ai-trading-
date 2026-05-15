@@ -119,7 +119,7 @@ class ScannerService {
                 const currentLimit = Math.min(user.max_trades_per_day || 5, planLimit);
 
                 if (todayCount >= currentLimit) {
-                    logger.info(`[SCANNER] User ${userId} (${user.plan_tier}) reached daily limit (${todayCount}/${currentLimit}). Skipping.`);
+                    logger.info(`[SCANNER] User ${userId} (${user.plan_tier}) reached daily limit (${todayCount}/${currentLimit}). Skipping.`, { userId });
                     continue;
                 }
 
@@ -149,7 +149,7 @@ class ScannerService {
 
                     if (indicators) {
                         // Pass quote and indicators to processEnterpriseFlow
-                        await this.processEnterpriseFlow(sym, userId, settings.auto_trade_on, quote, indicators);
+                        await this.processEnterpriseFlow(sym, userId, quote, indicators);
                     }
                     
                     // Small delay to prevent CPU spikes
@@ -164,7 +164,7 @@ class ScannerService {
     }
 
 
-    async processEnterpriseFlow(symbol, userId, autoTradeOn, quote, indicators) {
+    async processEnterpriseFlow(symbol, userId, quote, indicators) {
         try {
             if (!quote || !indicators) return;
 
@@ -193,15 +193,15 @@ class ScannerService {
                 if (indicators.rsi < 30) reasons.push('Oversold (RSI < 30)');
                 if (indicators.ema9 < indicators.ema20) reasons.push('Bearish Trend (EMA9 < EMA20)');
                 
-                logger.info(`[SCANNER] ${symbol} Rejected: Technical criteria not met.`, { reasons });
+                logger.info(`[SCANNER] ${symbol} Rejected: Technical criteria not met.`, { reasons, userId, symbol });
                 return;
             }
 
-            logger.success(`[SCANNER] ${symbol} PASSED Technical Check! ✅`, { side: rules.side, rsi: indicators.rsi });
+            logger.success(`[SCANNER] ${symbol} PASSED Technical Check! ✅`, { side: rules.side, rsi: indicators.rsi, userId, symbol });
 
 
             if (!settings.auto_trade_on) {
-                logger.info(`[SCANNER] Automation OFF for User. Skipping AI Analysis for ${symbol}.`);
+                logger.info(`[SCANNER] Automation OFF for User. Skipping AI Analysis for ${symbol}.`, { userId, symbol });
                 return;
             }
 
@@ -210,7 +210,7 @@ class ScannerService {
             // RE-CHECK PER-DAY LIMIT
             const todayCount = await supabaseService.getTodayTradeCount(userId);
             if (todayCount >= (settings.daily_trade_limit || 5)) {
-                logger.warn(`[SCANNER] Daily trade limit reached. Skipping AI for ${symbol}.`);
+                logger.warn(`[SCANNER] Daily trade limit reached. Skipping AI for ${symbol}.`, { userId, symbol });
                 return;
             }
             // PRE-AI CAPACITY CHECK (Cost Optimization)
@@ -227,10 +227,10 @@ class ScannerService {
                 // EXCEPTION: Only proceed to AI if the technical setup is extremely strong (STRICT)
                 const strictCheck = ta.checkRules(indicators, 'STRICT');
                 if (!strictCheck.pass) {
-                    logger.info(`[SCANNER] ${symbol} Utilization at ${currentUtilPct.toFixed(1)}%. Skipping AI as setup is not 'STRICT' quality.`);
+                    logger.info(`[SCANNER] ${symbol} Utilization at ${currentUtilPct.toFixed(1)}%. Skipping AI as setup is not 'STRICT' quality.`, { userId, symbol });
                     return;
                 }
-                logger.info(`[SCANNER] ${symbol} Utilization at ${currentUtilPct.toFixed(1)}%, but setup is STRICT quality. Proceeding to AI for high-probability check.`);
+                logger.info(`[SCANNER] ${symbol} Utilization at ${currentUtilPct.toFixed(1)}%, but setup is STRICT quality. Proceeding to AI for high-probability check.`, { userId, symbol });
             }
 
             // AI Analysis
@@ -239,7 +239,7 @@ class ScannerService {
             // Check configurable confidence threshold
             const confidenceThreshold = settings.ai_confidence_threshold || 70;
             if (aiResult.sentiment === 'NEUTRAL' || aiResult.confidenceScore < confidenceThreshold) {
-                logger.info(`[SCANNER] AI Analysis weak for ${symbol}: ${aiResult.sentiment} (${aiResult.confidenceScore} < ${confidenceThreshold}). Skipping.`);
+                logger.info(`[SCANNER] AI Analysis weak for ${symbol}: ${aiResult.sentiment} (${aiResult.confidenceScore} < ${confidenceThreshold}). Skipping.`, { userId, symbol });
                 return;
             }
 
@@ -384,26 +384,42 @@ class ScannerService {
             // Calculation B: Quantity by Allocation Limit
             let qtyByAlloc = Math.floor(targetAllocAmt / entryPrice);
 
-            // Final Qty is the lower of the two for safety
-            let qty = Math.min(qtyByRisk, qtyByAlloc);
+            // 5. ABSOLUTE CASH LIMIT (Safety Net)
+            const availableCash = capital;
+            const maxQtyByCash = Math.floor(availableCash / entryPrice);
+            
+            // Final Qty is the lowest of all three logic paths
+            let qty = Math.min(qtyByRisk, qtyByAlloc, maxQtyByCash);
 
             // Safety check: Cannot exceed remaining allowed utilization
             const remainingUtil = maxAllowedToInvest - investedCapital;
             const maxQtyByUtil = Math.floor(remainingUtil / entryPrice);
             if (qty > maxQtyByUtil) qty = maxQtyByUtil;
 
+            // Safety check: Ensure it doesn't exceed available cash (Double Check)
+            if (qty * entryPrice > availableCash) {
+                qty = Math.floor(availableCash / entryPrice);
+            }
+
             // Safety check: Ensure it meets MIN allocation (10%)
             const minAllocAmt = totalCapacity * (minAllocPct / 100);
             if (qty * entryPrice < minAllocAmt) {
                 // If the suggested qty is too low, we try to bump it to min allocation 
-                // BUT only if risk is still acceptable or we just return 0 to be safe
+                // BUT only if we have enough cash
                 const qtyToMeetMin = Math.ceil(minAllocAmt / entryPrice);
-                if (qtyToMeetMin * entryPrice <= remainingUtil) {
+                if (qtyToMeetMin * entryPrice <= availableCash && qtyToMeetMin * entryPrice <= remainingUtil) {
                     qty = qtyToMeetMin;
-                    logger.info(`[QTY] Bumping to min allocation: ${qty} shares (₹${(qty*entryPrice).toFixed(2)})`);
+                    logger.info(`[QTY] Bumping to min allocation: ${qty} shares (₹${(qty*entryPrice).toFixed(2)})`, { userId });
                 } else {
-                    logger.warn(`[QTY] Cannot meet min allocation of ${minAllocPct}% without exceeding utilization.`);
-                    return 0;
+                    // If we can't meet min allocation with available cash, we just use whatever we can OR skip
+                    const maxPossible = Math.floor(Math.min(availableCash, remainingUtil) / entryPrice);
+                    if (maxPossible > 0) {
+                        qty = maxPossible;
+                        logger.warn(`[QTY] Using reduced qty ${qty} (₹${(qty*entryPrice).toFixed(2)}) as min allocation cannot be met.`, { userId });
+                    } else {
+                        logger.warn(`[QTY] Cannot meet min allocation and insufficient cash. Skipping.`, { userId });
+                        return 0;
+                    }
                 }
             }
 
@@ -524,7 +540,7 @@ class ScannerService {
                         const creds = await supabaseService.getBrokerCredentials(trade.user_id);
 
                         // 1. REAL MODE → Place actual exit order on Angel One
-                        if (trade.trading_type === 'REAL') {
+                        if (trade.side === 'REAL') {
                             try {
                                 // Exit side is opposite of entry
                                 // BUY trade exit = SELL order | SELL trade exit = BUY order
@@ -562,7 +578,7 @@ class ScannerService {
                             .eq('id', trade.id);
 
                         // 3. Credit back to Wallet (Paper mode only)
-                        if (trade.trading_type === 'PAPER') {
+                        if (trade.side === 'PAPER') {
                             const qty = trade.quantity || 1;
                             const originalCost = trade.entry_price * qty;
                             const isBuy = trade.type === 'BUY';
@@ -586,7 +602,7 @@ class ScannerService {
                             exitReason: exitReason === 'SL' ? 'Stop Loss' : 'Take Profit',
                             pnl: pnlVal,
                             entryPrice: trade.entry_price,
-                            tradeMode: trade.trading_type || 'PAPER'
+                            tradeMode: trade.side || 'PAPER'
                         }, creds);
                         logger.success(`[MONITOR] ${trade.symbol} EXIT complete. P&L: ₹${pnlVal.toFixed(2)} | Reason: ${exitReason}`);
                     }

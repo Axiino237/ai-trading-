@@ -112,10 +112,10 @@ class TechnicalAnalysis {
      */
     checkRules(data, mode = 'STRICT') {
         const { ema9, ema20, ema50, rsi, macd, volume, avgVolume, candles } = data;
-        
+
         const lastCandle = candles[candles.length - 1];
         const prevCandle = candles[candles.length - 2];
-        
+
         const bullishPattern = this.isHammer(lastCandle) || this.isBullishEngulfing(prevCandle, lastCandle);
         const bearishPattern = this.isInvertedHammer(lastCandle) || this.isBearishEngulfing(prevCandle, lastCandle);
 
@@ -141,7 +141,7 @@ class TechnicalAnalysis {
             // SMART RELAXED MODE - Optimized for Profit/Entry Balance
             const trendUp = ema9 > ema20;
             const trendDown = ema9 < ema20;
-            
+
             // Check MACD Momentum (Directional)
             const macdBullish = macd.histogram > 0;
             const macdBearish = macd.histogram < 0;

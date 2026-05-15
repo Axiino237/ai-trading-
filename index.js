@@ -81,11 +81,14 @@ async function authenticateRequest(req, res, next) {
             return res.status(401).json({ error: 'User not found' });
         }
 
+        const settings = await supabaseService.getUserSettings(user.id);
+
         req.user = {
             id: user.id,
             name: user.name,
             email: user.email,
-            role: user.role || 'USER'
+            role: user.role || 'USER',
+            plan_tier: settings.plan_tier || 'STARTER'
         };
         req.sessionTokenHash = tokenHash;
         next();
@@ -317,12 +320,16 @@ app.get('/balances', async (req, res) => {
         // Fetch Invested
         const invested = await supabaseService.getInvestedCapitalAmount(userId, mode);
         
+        // Fetch Live P&L (Unrealized)
+        const livePnL = await supabaseService.getLivePnL(userId, mode, angelOneService);
+        
         res.json({ 
             real, 
             paper, 
             mode,
             invested,
-            totalEquity: (mode === 'REAL' ? real : paper) + invested
+            totalProfit: livePnL,
+            totalEquity: (mode === 'REAL' ? real : paper) + invested + livePnL
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -550,57 +557,7 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/trade/manual', async (req, res) => {
-    const { symbol, price, type, quantity = 1 } = req.body;
-    console.log(`[TRADE] Manual trade request: ${type} ${symbol} @ ${price}`);
-    try {
-        const userId = req.user.id;
-        if (!userId) throw new Error('No user found');
-        if (!symbol) throw new Error('Symbol is required');
-        if (!type || !['BUY', 'SELL'].includes(type.toUpperCase())) throw new Error('type must be BUY or SELL');
-        if (!price || isNaN(price)) throw new Error('Valid price is required');
 
-        const settings = await supabaseService.getUserSettings(userId);
-        const mode = settings.trade_mode || 'PAPER';
-        const tradeType = type.toUpperCase();
-        const entryPrice = parseFloat(price);
-        const qty = parseInt(quantity) || 1;
-        const tradeValue = entryPrice * qty;
-
-        // Deduct paper funds if PAPER mode
-        if (mode === 'PAPER') {
-            const balance = await supabaseService.getPaperFunds(userId);
-            if (balance < tradeValue) {
-                return res.status(400).json({ error: `Insufficient paper funds. Balance: ₹${balance.toFixed(2)}, Required: ₹${tradeValue.toFixed(2)}` });
-            }
-            await supabaseService.deductPaperFunds(userId, tradeValue, 'TRADE_OPEN', null);
-        }
-
-        // Insert trade record
-        const { data: trade, error: insertError } = await supabaseService.supabase
-            .from('trades')
-            .insert([{
-                user_id: userId,
-                symbol: symbol.toUpperCase(),
-                type: tradeType,
-                side: mode === 'REAL' ? 'REAL' : 'PAPER',
-                entry_price: entryPrice,
-                quantity: qty,
-                status: 'OPEN',
-                created_at: new Date().toISOString()
-            }])
-            .select()
-            .single();
-
-        if (insertError) throw insertError;
-
-        console.log(`[TRADE] Manual trade opened: ${tradeType} ${symbol} @ ${entryPrice} ✅`);
-        res.json({ success: true, trade });
-    } catch (error) {
-        console.error(`[TRADE] Manual open error:`, error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
 
 // Alias
 app.post('/trade/open', async (req, res) => {
@@ -737,57 +694,65 @@ app.post('/analyze', async (req, res) => {
 });
 
 app.post('/trade/manual', async (req, res) => {
-    const { symbol, side, price } = req.body;
+    const { symbol, type, price, quantity, sl, tp, holdingType, expectedDuration } = req.body;
     try {
         const userId = req.user.id;
         if (!userId) throw new Error('No user found');
+        if (!symbol || !type || !price) throw new Error('Symbol, type (BUY/SELL), and price are required');
 
         await angelOneService.loadSymbolMaster();
-        const scrip = angelOneService.symbolMaster.find(s => s.symbol.replace('-EQ', '').toUpperCase() === symbol.replace('-EQ', '').toUpperCase());
-        if (!scrip) throw new Error('Symbol not found');
+        const scrip = angelOneService.symbolMaster.find(s => 
+            s.symbol.replace('-EQ', '').toUpperCase() === symbol.replace('-EQ', '').toUpperCase()
+        );
+        if (!scrip) throw new Error(`Symbol ${symbol} not found in master list`);
 
-        const isBuy = side === 'BUY';
-        const sl = isBuy ? price * 0.98 : price * 1.02;
-        const tp = isBuy ? price * 1.04 : price * 0.96;
+        const isBuy = type.toUpperCase() === 'BUY';
+        const entryPrice = parseFloat(price);
+        const stopLoss = sl || (isBuy ? entryPrice * 0.98 : entryPrice * 1.02);
+        const takeProfit = tp || (isBuy ? entryPrice * 1.04 : entryPrice * 0.96);
 
         const settings = await supabaseService.getUserSettings(userId);
         const mode = settings.trade_mode || 'PAPER';
 
-        // Use user-provided quantity or fallback to dynamic calculation
-        let finalQuantity = req.body.quantity ? parseInt(req.body.quantity, 10) : 0;
-        
+        // Determine final quantity
+        let finalQuantity = quantity ? parseInt(quantity, 10) : 0;
         if (!finalQuantity || finalQuantity <= 0) {
-            finalQuantity = await scannerService.calculateQuantity(userId, price, sl, mode);
+            finalQuantity = await scannerService.calculateQuantity(userId, entryPrice, stopLoss, mode);
         }
 
         if (finalQuantity <= 0) {
             return res.status(400).json({ error: 'Insufficient funds or invalid quantity' });
         }
 
+        // Execute REAL order if applicable
         if (mode === 'REAL') {
-            await angelOneService.placeOrder(symbol, scrip.token, finalQuantity, side, 'LIMIT', price);
+            const creds = await supabaseService.getBrokerCredentials(userId);
+            if (!creds) throw new Error('Broker credentials not found for REAL trading');
+            await angelOneService.placeUserOrder(creds, symbol, scrip.token, finalQuantity, type.toUpperCase(), 'LIMIT', entryPrice);
         }
 
-        await supabaseService.saveTrade({
+        // Save trade and handle wallet deduction centrally
+        const result = await supabaseService.saveTrade({
             user_id: userId,
-            symbol,
+            symbol: symbol.toUpperCase(),
             symbolToken: scrip.token,
-            entry_price: price,
-            stop_loss: req.body.sl || sl,
-            take_profit: req.body.tp || tp,
+            entry_price: entryPrice,
+            stop_loss: stopLoss,
+            take_profit: takeProfit,
             quantity: finalQuantity,
-            side: side,
-            type: side,
+            type: type.toUpperCase(),
             status: 'OPEN',
             trade_mode: 'MANUAL',
             trading_type: mode,
-            holding_type: req.body.holdingType || 'SHORT_TERM',
-            expected_duration: req.body.expectedDuration || null
+            holding_type: holdingType || 'SHORT_TERM',
+            expected_duration: expectedDuration || null
         });
 
         if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL', userId });
-        res.json({ success: true });
+        
+        res.json({ success: true, trade: result.data?.[0] });
     } catch (error) {
+        console.error('[MANUAL TRADE ERROR]:', error.message);
         res.status(500).json({ error: error.message });
     }
 });

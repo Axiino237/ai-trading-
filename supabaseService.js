@@ -100,9 +100,11 @@ class SupabaseService {
      */
     async saveTrade(tradeData) {
         try {
+            const isPaper = tradeData.trading_type === 'PAPER' || tradeData.side === 'PAPER' || tradeData.tradingMode === 'PAPER';
+            const tradeType = tradeData.type || tradeData.side; // 'BUY' or 'SELL'
+            
             // 1. Mandatory Pre-Flight Check: Deduct from Paper Funds if mode is PAPER
-            // We MUST do this BEFORE inserting into the DB to prevent ghost trades when wallet is empty.
-            if (tradeData.trading_type === 'PAPER') {
+            if (isPaper) {
                 const totalCost = (tradeData.entry_price || 0) * (tradeData.quantity || 1);
                 const currentBalance = await this.getPaperFunds(tradeData.user_id);
                 
@@ -117,24 +119,25 @@ class SupabaseService {
                 .insert([{
                     user_id: tradeData.user_id,
                     symbol: tradeData.symbol,
-                    type: tradeData.type, // 'BUY' or 'SELL'
-                    side: `${tradeData.type === 'BUY' ? 'LONG' : 'SHORT'}_${tradeData.trading_type || 'PAPER'}`,
+                    type: tradeType, 
+                    side: isPaper ? 'PAPER' : 'REAL', // Simplified for easier monitoring
                     entry_price: tradeData.entry_price,
                     stop_loss: tradeData.stop_loss,
                     take_profit: tradeData.take_profit,
                     quantity: tradeData.quantity || 1,
-                    trade_mode: tradeData.trade_mode || 'BOT', // 'BOT' or 'MANUAL'
+                    trade_mode: tradeData.trade_mode || 'BOT', 
                     holding_type: tradeData.holding_type || 'SHORT_TERM',
                     expected_duration: tradeData.expected_duration || null,
                     status: 'OPEN',
                     created_at: new Date().toISOString()
-                }]);
+                }])
+                .select();
 
             if (error) throw error;
             const newTrade = data?.[0];
 
             // 3. Actually deduct the funds now that DB insert is successful
-            if (tradeData.trading_type === 'PAPER' && newTrade) {
+            if (isPaper && newTrade) {
                 const totalCost = (tradeData.entry_price || 0) * (tradeData.quantity || 1);
                 await this.deductPaperFunds(tradeData.user_id, totalCost, 'TRADE_ENTRY', newTrade.id);
             }
@@ -154,7 +157,7 @@ class SupabaseService {
             const { data, error } = await supabase
                 .from('trades')
                 .select('*')
-                .ilike('side', `%_${tradingType}`)
+                .eq('side', tradingType)
                 .order('created_at', { ascending: false });
 
             if (error) throw error;
@@ -186,16 +189,32 @@ class SupabaseService {
      */
     async getAutoEnabledUsers() {
         try {
-            const { data, error } = await supabase
+            // Fetch enabled settings first
+            const { data: settings, error: settingsError } = await supabase
                 .from('auto_settings')
-                .select('*, app_users(plan_tier)')
+                .select('*')
                 .eq('is_auto_active', true);
 
-            if (error) throw error;
-            // Flatten the result to make it easier to use
-            return (data || []).map(item => ({
-                ...item,
-                plan_tier: item.app_users?.plan_tier || 'STARTER'
+            if (settingsError) throw settingsError;
+            if (!settings || settings.length === 0) return [];
+
+            // Fetch user plan tiers separately to avoid relationship cache issues
+            const userIds = settings.map(s => s.user_id);
+            const { data: users, error: usersError } = await supabase
+                .from('app_users')
+                .select('id, plan_tier')
+                .in('id', userIds);
+
+            if (usersError) {
+                console.warn('[SUPABASE] Could not fetch user tiers, defaulting to STARTER:', usersError.message);
+            }
+
+            const userMap = {};
+            (users || []).forEach(u => userMap[u.id] = u.plan_tier);
+
+            return settings.map(s => ({
+                ...s,
+                plan_tier: userMap[s.user_id] || 'STARTER'
             }));
         } catch (error) {
             console.error('Supabase Fetch Enabled Users Error:', error.message);
@@ -605,16 +624,23 @@ class SupabaseService {
      */
     async saveLog(level, symbol, message, data, userId = null) {
         try {
-            await supabase.from('system_logs').insert([{
-                level, 
-                symbol, 
-                message, 
-                data,
-                user_id: userId,
+            const payload = {
+                level: level || 'info',
+                symbol: symbol || 'SYSTEM',
+                message: message || '',
+                data: data ? { ...data, userId } : { userId },
                 created_at: new Date().toISOString()
-            }]);
+            };
+            
+            const { error } = await this.supabase
+                .from('system_logs')
+                .insert([payload]);
+
+            if (error) {
+                console.error('[SUPABASE LOG ERROR]:', error.message);
+            }
         } catch (e) {
-            console.error('[LOG ERROR]', e.message);
+            console.error('[CRITICAL LOG ERROR]:', e.message);
         }
     }
 
@@ -670,7 +696,7 @@ class SupabaseService {
                 .select('entry_price, quantity')
                 .eq('user_id', userId)
                 .eq('status', 'OPEN')
-                .ilike('side', `%_${tradingMode}`);
+                .eq('side', tradingMode);
 
             if (error) throw error;
             
@@ -719,7 +745,7 @@ class SupabaseService {
                 .select('entry_price, quantity')
                 .eq('user_id', userId)
                 .eq('status', 'OPEN')
-                .ilike('side', `%_${tradingMode}`);
+                .eq('side', tradingMode);
 
             if (error) throw error;
             return (data || []).reduce((acc, t) => acc + (Number(t.entry_price) * (t.quantity || 1)), 0);
@@ -728,67 +754,42 @@ class SupabaseService {
         }
     }
 
-    async getUserSettings(userId) {
+    /**
+     * Calculate LIVE Unrealized P&L for all open positions
+     */
+    async getLivePnL(userId, tradingMode, angelOneService) {
         try {
-            const { data, error } = await supabase
-                .from('auto_settings')
+            const { data: openTrades, error } = await supabase
+                .from('trades')
                 .select('*')
                 .eq('user_id', userId)
-                .single();
-            if (error && error.code !== 'PGRST116') throw error;
-            return data || { trade_mode: 'PAPER', scan_mode: 'STRICT', max_trades: 5, is_auto_active: false };
+                .eq('status', 'OPEN')
+                .eq('side', tradingMode);
+
+            if (error || !openTrades || openTrades.length === 0) return 0;
+
+            const symbols = [...new Set(openTrades.map(t => t.symbol))];
+            const quotes = await angelOneService.getMultipleQuotes(symbols);
+            const quotesMap = new Map();
+            (quotes || []).forEach(q => quotesMap.set(q.tradingSymbol, q));
+
+            let totalPnL = 0;
+            for (const trade of openTrades) {
+                const quote = quotesMap.get(trade.symbol);
+                if (quote) {
+                    const ltp = quote.lastTradedPrice;
+                    const pnl = (ltp - trade.entry_price) * (trade.type === 'BUY' ? 1 : -1) * (trade.quantity || 1);
+                    totalPnL += pnl;
+                }
+            }
+            return totalPnL;
         } catch (e) {
-            console.error('getUserSettings Error:', e.message);
-            return { trade_mode: 'PAPER', scan_mode: 'STRICT', max_trades: 5, is_auto_active: false };
+            console.error('[SUPABASE] Live PnL Error:', e.message);
+            return 0;
         }
     }
 
-    async updateSettings(userId, updates) {
-        try {
-            // First check if a settings record exists for this user
-            const { data: existing } = await supabase
-                .from('auto_settings')
-                .select('id')
-                .eq('user_id', userId)
-                .single();
 
-            const payload = { 
-                user_id: userId,
-                ...updates
-            };
-
-            if (payload.max_trades !== undefined) {
-                payload.max_trades_per_day = payload.max_trades;
-                delete payload.max_trades;
-            }
-
-            if (updates.scan_mode) {
-                payload.is_auto_active = updates.scan_mode !== 'OFF';
-            }
-
-            if (existing) {
-                const { data, error } = await supabase
-                    .from('auto_settings')
-                    .update(payload)
-                    .eq('user_id', userId)
-                    .select()
-                    .single();
-                if (error) throw error;
-                return data;
-            } else {
-                const { data, error } = await supabase
-                    .from('auto_settings')
-                    .insert([payload])
-                    .select()
-                    .single();
-                if (error) throw error;
-                return data;
-            }
-        } catch (e) {
-            console.error('updateSettings Error:', e.message);
-            throw e;
-        }
-    }
 
     // --- BROKER CREDENTIALS ---
     
