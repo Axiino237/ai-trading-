@@ -211,8 +211,10 @@ app.post('/auth/logout', authenticateRequest, async (req, res) => {
 app.get('/market/search', async (req, res) => {
     const { query } = req.query;
     try {
-        const result = await angelOneService.searchScrip('NSE', query);
-        res.json(result.data || []);
+        const nseResults = await angelOneService.searchScrip('NSE', query);
+        const bseResults = await angelOneService.searchScrip('BSE', query);
+        const combined = [...(nseResults.data || []), ...(bseResults.data || [])].slice(0, 50);
+        res.json(combined);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -222,8 +224,10 @@ app.get('/market/search', async (req, res) => {
 app.get('/search', async (req, res) => {
     const { query } = req.query;
     try {
-        const result = await angelOneService.searchScrip('NSE', query);
-        res.json(result.data || []);
+        const nseResults = await angelOneService.searchScrip('NSE', query);
+        const bseResults = await angelOneService.searchScrip('BSE', query);
+        const combined = [...(nseResults.data || []), ...(bseResults.data || [])].slice(0, 50);
+        res.json(combined);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -698,7 +702,7 @@ app.post('/analyze', async (req, res) => {
 });
 
 app.post('/trade/manual', async (req, res) => {
-    const { symbol, type, price, quantity, sl, tp, holdingType, expectedDuration } = req.body;
+    const { symbol, type, price, quantity, sl, tp, holdingType, expectedDuration, orderType } = req.body;
     try {
         const userId = req.user.id;
         if (!userId) throw new Error('No user found');
@@ -717,6 +721,8 @@ app.post('/trade/manual', async (req, res) => {
 
         const settings = await supabaseService.getUserSettings(userId);
         const mode = settings.trade_mode || 'PAPER';
+        const finalOrderType = orderType || settings.order_type || 'LIMIT';
+        const productType = type.toUpperCase() === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD';
 
         // Determine final quantity
         let finalQuantity = quantity ? parseInt(quantity, 10) : 0;
@@ -732,7 +738,7 @@ app.post('/trade/manual', async (req, res) => {
         if (mode === 'REAL') {
             const creds = await supabaseService.getBrokerCredentials(userId);
             if (!creds) throw new Error('Broker credentials not found for REAL trading');
-            await angelOneService.placeUserOrder(creds, symbol, scrip.token, finalQuantity, type.toUpperCase(), 'LIMIT', entryPrice);
+            await angelOneService.placeUserOrder(creds, symbol, scrip.token, finalQuantity, type.toUpperCase(), finalOrderType, entryPrice, productType);
         }
 
         // Save trade and handle wallet deduction centrally
@@ -749,7 +755,8 @@ app.post('/trade/manual', async (req, res) => {
             trade_mode: 'MANUAL',
             trading_type: mode,
             holding_type: holdingType || 'SHORT_TERM',
-            expected_duration: expectedDuration || null
+            expected_duration: expectedDuration || null,
+            product_type: productType
         });
 
         if (global.io) global.io.emit('trade-executed', { symbol, mode: 'MANUAL', userId });
@@ -767,7 +774,8 @@ app.post('/trade/manual', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', async () => {
-    console.log(`Backend listening at http://0.0.0.0:${PORT}`);
+    console.log(`Backend listening at http://localhost:${PORT}`);
+    console.log(`Bound to all interfaces (0.0.0.0) for cross-IP compatibility.`);
     try {
         await angelOneService.login();
         scannerService.start();

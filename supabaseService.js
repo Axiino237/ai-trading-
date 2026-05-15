@@ -128,6 +128,7 @@ class SupabaseService {
                     trade_mode: tradeData.trade_mode || 'BOT', 
                     holding_type: tradeData.holding_type || 'SHORT_TERM',
                     expected_duration: tradeData.expected_duration || null,
+                    product_type: tradeData.product_type || (tradeType === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD'),
                     status: 'OPEN',
                     created_at: new Date().toISOString()
                 }])
@@ -321,20 +322,17 @@ class SupabaseService {
 
     async deductPaperFunds(userId, amount, reason = 'UNKNOWN', tradeId = null) {
         try {
-            const current = await this.getPaperFunds(userId);
             const amt = parseFloat(amount);
-            const newBalance = parseFloat((current - amt).toFixed(2));
+            console.log(`[WALLET] Atomic Deduction: ₹${amt} for User ${userId}`);
             
-            // 1. Update Balance
-            const { error } = await supabase
-                .from('paper_funds')
-                .upsert({ user_id: userId, balance: newBalance }, { onConflict: 'user_id' });
-            
+            const { error } = await supabase.rpc('update_paper_balance', { 
+                u_id: userId, 
+                amt: -Math.abs(amt) 
+            });
             if (error) throw error;
 
-            // 2. Log Transaction
+            const newBalance = await this.getPaperFunds(userId);
             await this.logWalletAction(userId, amt, 'DEBIT', reason, newBalance, tradeId);
-            
             return newBalance;
         } catch (e) {
             console.error('Wallet deduction failed:', e.message);
@@ -344,20 +342,17 @@ class SupabaseService {
 
     async creditPaperFunds(userId, amount, reason = 'UNKNOWN', tradeId = null) {
         try {
-            const current = await this.getPaperFunds(userId);
             const amt = parseFloat(amount);
-            const newBalance = parseFloat((current + amt).toFixed(2));
-            
-            // 1. Update Balance
-            const { error } = await supabase
-                .from('paper_funds')
-                .upsert({ user_id: userId, balance: newBalance }, { onConflict: 'user_id' });
-            
+            console.log(`[WALLET] Atomic Credit: ₹${amt} for User ${userId}`);
+
+            const { error } = await supabase.rpc('update_paper_balance', { 
+                u_id: userId, 
+                amt: Math.abs(amt) 
+            });
             if (error) throw error;
 
-            // 2. Log Transaction
+            const newBalance = await this.getPaperFunds(userId);
             await this.logWalletAction(userId, amt, 'CREDIT', reason, newBalance, tradeId);
-            
             return newBalance;
         } catch (e) {
             console.error('Wallet credit failed:', e.message);
@@ -545,6 +540,8 @@ class SupabaseService {
                 max_allocation_pct: data ? (data.max_allocation_pct || 20) : 20,
                 short_term_ratio: data ? (data.short_term_ratio || 70) : 70,
                 ai_confidence_threshold: data ? (data.ai_confidence_threshold || 70) : 70,
+                order_type: data ? (data.order_type || 'LIMIT') : 'LIMIT',
+                smart_mode: data ? (data.smart_mode || false) : false,
                 role: user ? user.role : 'USER',
                 plan_tier: user ? user.plan_tier : 'STARTER'
             };
@@ -618,7 +615,9 @@ class SupabaseService {
                 min_allocation_pct: updates.min_allocation_pct !== undefined ? updates.min_allocation_pct : (current ? current.min_allocation_pct : 10),
                 max_allocation_pct: updates.max_allocation_pct !== undefined ? updates.max_allocation_pct : (current ? current.max_allocation_pct : 20),
                 short_term_ratio: updates.short_term_ratio !== undefined ? updates.short_term_ratio : (current ? current.short_term_ratio : 70),
-                ai_confidence_threshold: updates.ai_confidence_threshold !== undefined ? updates.ai_confidence_threshold : (current ? current.ai_confidence_threshold : 70)
+                ai_confidence_threshold: updates.ai_confidence_threshold !== undefined ? updates.ai_confidence_threshold : (current ? current.ai_confidence_threshold : 70),
+                order_type: updates.order_type || (current ? current.order_type : 'LIMIT'),
+                smart_mode: updates.smart_mode !== undefined ? updates.smart_mode : (current ? (current.smart_mode || false) : false)
             };
 
             console.log(`[SETTINGS] Upserting to DB:`, JSON.stringify(dbSettings));
@@ -877,6 +876,21 @@ class SupabaseService {
             console.error('updateBrokerCredentials Error:', e.message);
             throw e;
         }
+    }
+
+    async getSystemState(key) {
+        const { data } = await supabase
+            .from('system_maintenance')
+            .select('value')
+            .eq('key', key)
+            .single();
+        return data?.value;
+    }
+
+    async setSystemState(key, value) {
+        await supabase
+            .from('system_maintenance')
+            .upsert({ key, value, updated_at: new Date().toISOString() });
     }
 }
 

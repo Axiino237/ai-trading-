@@ -32,6 +32,20 @@ class ScannerService {
         console.log('[ENTERPRISE] AI Rule Engine Started... 🚀');
         this.safeScan();
         this.startBroadcaster();
+        this.startSquareOffMonitor(); // Day end square-off check
+    }
+
+    startSquareOffMonitor() {
+        const run = async () => {
+            try {
+                await this.checkAutoSquareOff();
+            } catch (e) {
+                console.error('[SQUARE-OFF MONITOR ERROR]:', e.message);
+            }
+            // Check every minute
+            setTimeout(run, 60000);
+        };
+        run();
     }
 
     startBroadcaster() {
@@ -247,7 +261,12 @@ class ScannerService {
             }
 
             // AI Analysis
-            const aiResult = await this.getAIAnalysis(symbol, quote.lastTradedPrice, indicators);
+            const aiResult = await this.getAIAnalysis({ 
+                symbol, 
+                price: quote.lastTradedPrice, 
+                indicators, 
+                smartMode: settings.smart_mode 
+            });
             
             // Check configurable confidence threshold
             const confidenceThreshold = settings.ai_confidence_threshold || 70;
@@ -306,55 +325,49 @@ class ScannerService {
         }
     }
 
-    async getAIAnalysis(symbol, price, indicators) {
-        const trend = indicators.ema9 > indicators.ema50 ? 'Bullish' : 'Bearish';
-        const prompt = `
-            Expert Quant Trader Analysis (Level: Senior Strategist):
-            SYMBOL: ${symbol} @ ₹${price}
-            TECHNICAL DATA: 
-            - RSI (14): ${indicators.rsi.toFixed(2)}
-            - MACD Histogram: ${indicators.macd.histogram.toFixed(2)}
-            - EMA Trend (9 vs 50): ${trend}
-            - Volume vs 20-Avg: ${(indicators.volume / indicators.avgVolume).toFixed(1)}x
+    async getAIAnalysis({ symbol, price, indicators, smartMode = false }) {
+        const trend = indicators.ema9 > indicators.ema50 ? 'BULLISH' : 'BEARISH';
+        
+        // ELITE PROMPT (Only for Smart Mode)
+        if (smartMode) {
+            const candleSummary = indicators.candles.slice(-5).map(c => `[O:${c[1]}, H:${c[2]}, L:${c[3]}, C:${c[4]}, V:${c[5]}]`).join(' | ');
+            const elitePrompt = `
+                You are an Elite Institutional Algorithmic Trader. Identify high-probability setups.
+                SYMBOL: ${symbol} @ ₹${price}
+                EMA Trend: ${trend} | RSI: ${indicators.rsi.toFixed(2)} | MACD: ${indicators.macd.histogram.toFixed(2)}
+                LAST 5 CANDLES: ${candleSummary}
+                RULES: BUY if Price>EMA9, MACD increasing, RSI 40-70. SELL if Price<EMA9, MACD decreasing, RSI 30-60.
+                OUTPUT JSON: {"sentiment": "BUY"|"SELL"|"NEUTRAL", "confidenceScore": 0-100, "reasoning": "...", "sl": price, "tp": price, "holdingType": "SHORT_TERM"}
+            `;
+            return await this.executeAI(elitePrompt, price);
+        }
 
-            TASK: 
-            1. Analyze for BOTH BUY (Long) and SELL (Short) opportunities based on price action and indicator alignment.
-            2. For Short Selling (SELL), look for trend reversal at resistance or breakdown of support.
-            3. For BUY, look for trend continuation or bounce from support.
-            4. Be extremely selective. Only suggest a trade if confidence is high.
-
-            OUTPUT JSON ONLY: {
-                "sentiment": "BUY" | "SELL" | "NEUTRAL", 
-                "confidenceScore": 0-100, 
-                "reasoning": "Brief technical explanation for decision",
-                "riskLevel": "Low/Medium/High", 
-                "suggestedHolding": "e.g. 1-2 days", 
-                "winProbability": 0-100, 
-                "holdingType": "SHORT_TERM" | "LONG_TERM"
-            }
+        // STANDARD PROMPT (Fallback)
+        const standardPrompt = `
+            Analyze ${symbol} at ₹${price}. 
+            Trend: ${trend}, RSI: ${indicators.rsi.toFixed(2)}, MACD: ${indicators.macd.histogram.toFixed(2)}.
+            Suggest BUY, SELL, or NEUTRAL.
+            OUTPUT JSON: {"sentiment": "BUY"|"SELL"|"NEUTRAL", "confidenceScore": 0-100, "reasoning": "...", "holdingType": "SHORT_TERM"}
         `;
+        return await this.executeAI(standardPrompt, price);
+    }
+
+    async executeAI(prompt, price) {
         try {
             const text = await geminiService.generateAnalysis(prompt);
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (!jsonMatch) throw new Error('AI failed to return valid JSON');
             const result = JSON.parse(jsonMatch[0]);
             
-            // Calculate SL/TP automatically if not provided by AI
-            const risk = this.calculateRisk(price, result.sentiment);
-            result.sl = risk.sl;
-            result.tp = risk.tp;
-            
+            if (!result.sl || !result.tp) {
+                const risk = this.calculateRisk(price, result.sentiment);
+                result.sl = result.sl || risk.sl;
+                result.tp = result.tp || risk.tp;
+            }
             return result;
         } catch (e) {
-            console.error('[AI ENGINE ERROR]:', e.message);
-            return { 
-                sentiment: 'NEUTRAL', 
-                confidenceScore: 0, 
-                holdingType: 'ERROR', 
-                explanation: e.message.includes('quota') || e.message.includes('429') 
-                    ? 'Gemini API limit reached (20 req/day). Please wait or add new keys.' 
-                    : 'AI engine temporarily unavailable due to limits.'
-            };
+            console.error('[AI ERROR]:', e.message);
+            return { sentiment: 'NEUTRAL', confidenceScore: 0, reasoning: 'AI Offline' };
         }
     }
 
@@ -472,7 +485,9 @@ class ScannerService {
         try {
             logger.info(`[EXECUTION START] Processing ${side} for ${symbol} (Qty: ${quantity}, Mode: ${tradingType})...`);
             
-            // 1. Always save to DB first (Ensures we have a record of the attempt)
+            const productType = side === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD';
+            const orderType = settings.order_type || 'LIMIT';
+
             logger.info(`[DATABASE] Creating ${tradingType} trade record...`);
             const dbResult = await supabaseService.saveTrade({
                 user_id: userId,
@@ -483,11 +498,11 @@ class ScannerService {
                 entry_price: risk.entry,
                 stop_loss: risk.sl,
                 take_profit: risk.tp,
-                status: 'OPEN',
                 trading_type: tradingType,
                 trade_mode: 'BOT',
                 holding_type: holdingType,
-                expected_duration: duration
+                expected_duration: duration,
+                product_type: productType
             });
             
             tradeRecord = dbResult.data?.[0];
@@ -499,7 +514,7 @@ class ScannerService {
                     if (!creds || !creds.api_key) {
                         throw new Error('Broker credentials not configured for this user.');
                     }
-                    const orderRes = await angelOneService.placeUserOrder(creds, symbol, token, quantity, side, 'LIMIT', risk.entry);
+                    const orderRes = await angelOneService.placeUserOrder(creds, symbol, token, quantity, side, orderType, risk.entry, productType);
                     
                     if (!orderRes.status) {
                         throw new Error(orderRes.message || 'Broker order rejected');
@@ -558,6 +573,31 @@ class ScannerService {
                     let shouldClose = false;
                     let exitReason = '';
 
+                    // 1. Fetch User Settings to check for Smart Mode
+                    const userSettings = await supabaseService.getUserSettings(trade.user_id);
+
+                    // 2. TRAILING STOP LOSS (Only in SMART MODE)
+                    if (userSettings.smart_mode) {
+                        const profitPct = trade.type === 'BUY' 
+                            ? (ltp - trade.entry_price) / trade.entry_price * 100
+                            : (trade.entry_price - ltp) / trade.entry_price * 100;
+
+                        if (profitPct >= 2.0) {
+                            const isSlAtEntry = trade.type === 'BUY' 
+                                ? trade.stop_loss >= trade.entry_price
+                                : trade.stop_loss <= trade.entry_price;
+
+                            if (!isSlAtEntry) {
+                                console.log(`[MONITOR] ${trade.symbol} in 2% profit (Smart Mode). Trailing SL to Entry Price... 🛡️`);
+                                await supabaseService.supabase
+                                    .from('trades')
+                                    .update({ stop_loss: trade.entry_price })
+                                    .eq('id', trade.id);
+                                trade.stop_loss = trade.entry_price; 
+                            }
+                        }
+                    }
+
                     if (trade.type === 'BUY') {
                         if (ltp <= trade.stop_loss) { shouldClose = true; exitReason = 'SL'; }
                         else if (ltp >= trade.take_profit) { shouldClose = true; exitReason = 'TP'; }
@@ -578,8 +618,7 @@ class ScannerService {
                                 // BUY trade exit = SELL order | SELL trade exit = BUY order
                                 const exitSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
                                 // Determine product type to square off correctly
-                                // If original was SELL, it was INTRADAY. If original was BUY, it was CARRYFORWARD.
-                                const originalProductType = trade.type === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD';
+                                const originalProductType = trade.product_type || (trade.type === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD');
                                 
                                 logger.info(`[ANGEL EXIT] Placing REAL ${exitSide} exit order for ${trade.symbol} @ ₹${ltp} (${originalProductType})...`);
                                 
@@ -649,6 +688,64 @@ class ScannerService {
             }
         } catch (error) {
             console.error('[MONITOR ENGINE ERROR]:', error.message);
+        }
+    }
+
+    /**
+     * Day-End Square-off (3:15 PM IST)
+     * Closes all INTRADAY positions automatically
+     */
+    async checkAutoSquareOff() {
+        const now = new Date();
+        const today = now.toISOString().split('T')[0];
+
+        // 1. Check if already squared off today
+        const lastRun = await supabaseService.getSystemState('last_square_off_date');
+        if (lastRun === today) return;
+
+        const istTime = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata', hour12: false });
+        const timeParts = istTime.split(', ')[1];
+        if (!timeParts) return;
+        
+        const [hour, minute] = timeParts.split(':').map(Number);
+        const currentTime = hour * 60 + minute;
+        
+        const squareOffStartTime = 15 * 60 + 15; // 3:15 PM
+
+        if (currentTime >= squareOffStartTime) {
+            console.log(`[SQUARE-OFF] Market closing soon/closed. Running Daily Auto Square-off... ⏰`);
+            
+            const { data: openIntradayTrades } = await supabaseService.supabase
+                .from('trades')
+                .select('*')
+                .eq('status', 'OPEN')
+                .eq('product_type', 'INTRADAY');
+
+            if (openIntradayTrades && openIntradayTrades.length > 0) {
+                for (const trade of openIntradayTrades) {
+                    console.log(`[SQUARE-OFF] Force closing INTRADAY: ${trade.symbol}...`);
+                    try {
+                        const quote = await angelOneService.getQuote(trade.symbol);
+                        const ltp = quote?.lastTradedPrice || trade.entry_price;
+                        const creds = await supabaseService.getBrokerCredentials(trade.user_id);
+
+                        if (trade.side === 'REAL' && creds) {
+                            const exitSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
+                            await angelOneService.placeUserOrder(
+                                creds, trade.symbol, trade.symbolToken, trade.quantity,
+                                exitSide, 'MARKET', 0, trade.product_type
+                            );
+                        }
+                        await supabaseService.closeTrade(trade.id, ltp, 'AUTO_SQUARE_OFF');
+                    } catch (e) {
+                        console.error(`[SQUARE-OFF ERROR] Failed for ${trade.symbol}:`, e.message);
+                    }
+                }
+            }
+
+            // Mark as done for today
+            await supabaseService.setSystemState('last_square_off_date', today);
+            console.log(`[SQUARE-OFF] Completed for ${today} ✅`);
         }
     }
 }
