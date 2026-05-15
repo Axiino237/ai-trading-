@@ -602,13 +602,17 @@ app.post('/trade/close', async (req, res) => {
                 throw new Error('Broker credentials not configured for this user.');
             }
 
+            const originalProductType = trade.type === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD';
+            
             await angelOneService.placeUserOrder(
                 creds,
                 symbol,
                 quote.symbolToken,
                 quantity,
                 oppositeSide,
-                "MARKET"
+                "MARKET",
+                0,
+                originalProductType
             );
             console.log(`[ANGEL] Exit order placed for ${symbol} @ ${exitPrice} ✅`);
         } else {

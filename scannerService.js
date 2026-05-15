@@ -116,10 +116,13 @@ class ScannerService {
                 
                 // ENFORCE PLAN LIMITS (Gating Logic)
                 const planLimit = user.plan_tier === 'PRO' ? 100 : 5;
-                const currentLimit = Math.min(user.max_trades_per_day || 5, planLimit);
+                // If ADMIN, follow their settings exactly. If USER, cap settings by plan limit.
+                const currentLimit = user.role === 'ADMIN' 
+                    ? (user.max_trades_per_day || 999) 
+                    : Math.min(user.max_trades_per_day || 5, planLimit);
 
                 if (todayCount >= currentLimit) {
-                    logger.info(`[SCANNER] User ${userId} (${user.plan_tier}) reached daily limit (${todayCount}/${currentLimit}). Skipping.`, { userId });
+                    logger.info(`[SCANNER] User ${userId} (${user.role}/${user.plan_tier}) reached limit (${todayCount}/${currentLimit}). skipping.`, { userId });
                     continue;
                 }
 
@@ -189,11 +192,14 @@ class ScannerService {
             if (!rules.pass) {
                 // DETAILED REJECTION LOGGING
                 const reasons = [];
+                const trend = indicators.ema9 > indicators.ema20 ? 'UP' : 'DOWN';
+                
                 if (indicators.rsi > 70) reasons.push('Overbought (RSI > 70)');
                 if (indicators.rsi < 30) reasons.push('Oversold (RSI < 30)');
-                if (indicators.ema9 < indicators.ema20) reasons.push('Bearish Trend (EMA9 < EMA20)');
+                if (trend === 'DOWN') reasons.push('Bearish Trend (EMA9 < EMA20)');
+                if (trend === 'UP') reasons.push('Bullish Trend (EMA9 > EMA20)');
                 
-                logger.info(`[SCANNER] ${symbol} Rejected: Technical criteria not met.`, { reasons, userId, symbol });
+                logger.info(`[SCANNER] ${symbol} Rejected: No valid BUY or SELL setup.`, { reasons, userId, symbol });
                 return;
             }
 
@@ -209,10 +215,17 @@ class ScannerService {
 
             // RE-CHECK PER-DAY LIMIT
             const todayCount = await supabaseService.getTodayTradeCount(userId);
-            if (todayCount >= (settings.daily_trade_limit || 5)) {
-                logger.warn(`[SCANNER] Daily trade limit reached. Skipping AI for ${symbol}.`, { userId, symbol });
+            const planLimit = settings.plan_tier === 'PRO' ? 100 : 5;
+            const currentLimit = settings.role === 'ADMIN' 
+                ? (settings.daily_trade_limit || 999) 
+                : Math.min(settings.daily_trade_limit || 5, planLimit);
+
+            if (todayCount >= currentLimit) {
+                logger.warn(`[SCANNER] ${symbol} limit reached (${todayCount}/${currentLimit}). Skipping.`, { userId, symbol });
                 return;
             }
+            
+            const isLimitBypassed = settings.role === 'ADMIN'; // For utilization check below
             // PRE-AI CAPACITY CHECK (Cost Optimization)
             const investedCapital = await supabaseService.getInvestedCapital(userId, tradingMode);
             const totalFundsAvailable = (tradingMode === 'REAL') 
@@ -223,7 +236,7 @@ class ScannerService {
             const maxUtilization = settings.max_utilization_pct || 60;
             const currentUtilPct = totalCapacity > 0 ? (investedCapital / totalCapacity) * 100 : 0;
 
-            if (currentUtilPct >= maxUtilization) {
+            if (!isLimitBypassed && currentUtilPct >= maxUtilization) {
                 // EXCEPTION: Only proceed to AI if the technical setup is extremely strong (STRICT)
                 const strictCheck = ta.checkRules(indicators, 'STRICT');
                 if (!strictCheck.pass) {
@@ -294,12 +307,31 @@ class ScannerService {
     }
 
     async getAIAnalysis(symbol, price, indicators) {
+        const trend = indicators.ema9 > indicators.ema50 ? 'Bullish' : 'Bearish';
         const prompt = `
-            Expert Quant Trader Analysis:
+            Expert Quant Trader Analysis (Level: Senior Strategist):
             SYMBOL: ${symbol} @ ₹${price}
-            INDICATORS: RSI: ${indicators.rsi.toFixed(2)}, MACD Histogram: ${indicators.macd.histogram.toFixed(2)}, EMA Trend: ${indicators.ema9 > indicators.ema50 ? 'Bullish' : 'Bearish'}
-            TASK: Compare with 2-year historical setups. Detect false breakouts.
-            OUTPUT JSON: {"sentiment": "BUY", "confidenceScore": 92, "riskLevel": "Low", "suggestedHolding": "2 days", "winProbability": 88, "holdingType": "SHORT_TERM"}
+            TECHNICAL DATA: 
+            - RSI (14): ${indicators.rsi.toFixed(2)}
+            - MACD Histogram: ${indicators.macd.histogram.toFixed(2)}
+            - EMA Trend (9 vs 50): ${trend}
+            - Volume vs 20-Avg: ${(indicators.volume / indicators.avgVolume).toFixed(1)}x
+
+            TASK: 
+            1. Analyze for BOTH BUY (Long) and SELL (Short) opportunities based on price action and indicator alignment.
+            2. For Short Selling (SELL), look for trend reversal at resistance or breakdown of support.
+            3. For BUY, look for trend continuation or bounce from support.
+            4. Be extremely selective. Only suggest a trade if confidence is high.
+
+            OUTPUT JSON ONLY: {
+                "sentiment": "BUY" | "SELL" | "NEUTRAL", 
+                "confidenceScore": 0-100, 
+                "reasoning": "Brief technical explanation for decision",
+                "riskLevel": "Low/Medium/High", 
+                "suggestedHolding": "e.g. 1-2 days", 
+                "winProbability": 0-100, 
+                "holdingType": "SHORT_TERM" | "LONG_TERM"
+            }
         `;
         try {
             const text = await geminiService.generateAnalysis(prompt);
@@ -545,7 +577,11 @@ class ScannerService {
                                 // Exit side is opposite of entry
                                 // BUY trade exit = SELL order | SELL trade exit = BUY order
                                 const exitSide = trade.type === 'BUY' ? 'SELL' : 'BUY';
-                                logger.info(`[ANGEL EXIT] Placing REAL ${exitSide} exit order for ${trade.symbol} @ ₹${ltp}...`);
+                                // Determine product type to square off correctly
+                                // If original was SELL, it was INTRADAY. If original was BUY, it was CARRYFORWARD.
+                                const originalProductType = trade.type === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD';
+                                
+                                logger.info(`[ANGEL EXIT] Placing REAL ${exitSide} exit order for ${trade.symbol} @ ₹${ltp} (${originalProductType})...`);
                                 
                                 if (!creds || !creds.api_key) {
                                     throw new Error('Broker credentials not configured for this user.');
@@ -557,8 +593,9 @@ class ScannerService {
                                     trade.symbolToken,
                                     trade.quantity || 1,
                                     exitSide,
-                                    'MARKET', // Market order for instant exit
-                                    0         // Price = 0 for MARKET orders
+                                    'MARKET', 
+                                    0,
+                                    originalProductType
                                 );
                                 logger.success(`[ANGEL EXIT] Real exit order placed for ${trade.symbol}! ✅`);
                             } catch (exitErr) {

@@ -202,7 +202,7 @@ class SupabaseService {
             const userIds = settings.map(s => s.user_id);
             const { data: users, error: usersError } = await supabase
                 .from('app_users')
-                .select('id, plan_tier')
+                .select('id, plan_tier, role')
                 .in('id', userIds);
 
             if (usersError) {
@@ -210,11 +210,12 @@ class SupabaseService {
             }
 
             const userMap = {};
-            (users || []).forEach(u => userMap[u.id] = u.plan_tier);
+            (users || []).forEach(u => userMap[u.id] = { plan_tier: u.plan_tier, role: u.role });
 
             return settings.map(s => ({
                 ...s,
-                plan_tier: userMap[s.user_id] || 'STARTER'
+                plan_tier: userMap[s.user_id]?.plan_tier || 'STARTER',
+                role: userMap[s.user_id]?.role || 'USER'
             }));
         } catch (error) {
             console.error('Supabase Fetch Enabled Users Error:', error.message);
@@ -523,6 +524,12 @@ class SupabaseService {
                 .eq('user_id', userId)
                 .single();
 
+            const { data: user } = await supabase
+                .from('app_users')
+                .select('role, plan_tier')
+                .eq('id', userId)
+                .single();
+
             console.log(`[DEBUG] DB Data:`, data ? 'Found' : 'Missing');
             
             const finalSettings = {
@@ -537,7 +544,9 @@ class SupabaseService {
                 min_allocation_pct: data ? (data.min_allocation_pct || 10) : 10,
                 max_allocation_pct: data ? (data.max_allocation_pct || 20) : 20,
                 short_term_ratio: data ? (data.short_term_ratio || 70) : 70,
-                ai_confidence_threshold: data ? (data.ai_confidence_threshold || 70) : 70
+                ai_confidence_threshold: data ? (data.ai_confidence_threshold || 70) : 70,
+                role: user ? user.role : 'USER',
+                plan_tier: user ? user.plan_tier : 'STARTER'
             };
             console.log(`[SETTINGS] Loaded:`, JSON.stringify(finalSettings));
             return finalSettings;
@@ -570,16 +579,31 @@ class SupabaseService {
         try {
             console.log(`[SETTINGS UPDATE] Incoming for ${userId}:`, JSON.stringify(updates));
             
-            // 1. Fetch current settings to avoid overwriting with undefined
+            // 1. Fetch current settings and user profile to check role/plan
             const { data: current } = await supabase
                 .from('auto_settings')
                 .select('*')
                 .eq('user_id', userId)
                 .single();
 
+            const { data: user } = await supabase
+                .from('app_users')
+                .select('role, plan_tier')
+                .eq('id', userId)
+                .single();
+
             // 2. Map UI fields back to DB columns
             const autoActive = updates.auto_trade_on !== undefined ? updates.auto_trade_on : updates.is_auto_active;
-            const dailyLimit = updates.daily_trade_limit !== undefined ? updates.daily_trade_limit : updates.max_trades_per_day;
+            let dailyLimit = updates.daily_trade_limit !== undefined ? updates.daily_trade_limit : updates.max_trades_per_day;
+            
+            // Validate dailyLimit against plan (Bypassed for ADMIN)
+            if (user && user.role !== 'ADMIN') {
+                const planLimit = user.plan_tier === 'PRO' ? 100 : 5;
+                if (dailyLimit > planLimit) {
+                    console.log(`[SETTINGS] Capping limit for user ${userId} from ${dailyLimit} to ${planLimit} (${user.plan_tier})`);
+                    dailyLimit = planLimit;
+                }
+            }
             const tradeMode = updates.trade_mode || (current ? current.trade_mode : 'PAPER');
 
             const dbSettings = {

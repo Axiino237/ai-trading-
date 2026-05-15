@@ -255,6 +255,9 @@ class AngelOneService {
     async placeOrder(symbol, symbolToken, quantity, side, type = "LIMIT", price = 0) {
         await this.ensureSession();
         try {
+            // Determine product type: Short selling in Equity requires INTRADAY (MIS)
+            const productType = side.toUpperCase() === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD';
+
             const response = await this.smartApi.placeOrder({
                 variety: "NORMAL",
                 tradingsymbol: symbol,
@@ -262,7 +265,7 @@ class AngelOneService {
                 transactiontype: side.toUpperCase(),
                 exchange: "NSE",
                 ordertype: type,
-                producttype: "CARRYFORWARD",
+                producttype: productType,
                 duration: "DAY",
                 price: price.toString(),
                 squareoff: "0",
@@ -272,6 +275,47 @@ class AngelOneService {
             return response;
         } catch (error) {
             throw error;
+        }
+    }
+
+    /**
+     * Place order for a specific user using their credentials
+     */
+    async placeUserOrder(userCreds, symbol, symbolToken, quantity, side, type = "LIMIT", price = 0, productType = null) {
+        try {
+            const { SmartAPI } = require('smartapi-javascript');
+            const { TOTP } = require('totp-generator');
+            
+            const userApi = new SmartAPI({ api_key: userCreds.api_key });
+            const { otp: totpToken } = await TOTP.generate(userCreds.totp_secret);
+            const loginRes = await userApi.generateSession(userCreds.client_id, userCreds.password, totpToken);
+            
+            if (!loginRes.status) {
+                return { status: false, message: loginRes.message || 'User login failed' };
+            }
+
+            // Determine product type: Short selling in Equity requires INTRADAY (MIS)
+            // If productType is explicitly provided (e.g. for exits), use it.
+            const finalProductType = productType || (side.toUpperCase() === 'SELL' ? 'INTRADAY' : 'CARRYFORWARD');
+
+            const response = await userApi.placeOrder({
+                variety: "NORMAL",
+                tradingsymbol: symbol,
+                symboltoken: symbolToken,
+                transactiontype: side.toUpperCase(),
+                exchange: "NSE",
+                ordertype: type,
+                producttype: finalProductType,
+                duration: "DAY",
+                price: (price || 0).toString(),
+                squareoff: "0",
+                stoploss: "0",
+                quantity: quantity.toString()
+            });
+            return response;
+        } catch (error) {
+            console.error('[ANGEL] placeUserOrder error:', error.message);
+            return { status: false, message: error.message };
         }
     }
 
