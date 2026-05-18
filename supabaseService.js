@@ -325,13 +325,14 @@ class SupabaseService {
             const amt = parseFloat(amount);
             console.log(`[WALLET] Atomic Deduction: ₹${amt} for User ${userId}`);
             
-            const { error } = await supabase.rpc('update_paper_balance', { 
-                u_id: userId, 
-                amt: -Math.abs(amt) 
-            });
+            const currentBalance = await this.getPaperFunds(userId);
+            const newBalance = currentBalance - Math.abs(amt);
+            const { error } = await supabase
+                .from('paper_funds')
+                .update({ balance: newBalance })
+                .eq('user_id', userId);
             if (error) throw error;
 
-            const newBalance = await this.getPaperFunds(userId);
             await this.logWalletAction(userId, amt, 'DEBIT', reason, newBalance, tradeId);
             return newBalance;
         } catch (e) {
@@ -345,13 +346,14 @@ class SupabaseService {
             const amt = parseFloat(amount);
             console.log(`[WALLET] Atomic Credit: ₹${amt} for User ${userId}`);
 
-            const { error } = await supabase.rpc('update_paper_balance', { 
-                u_id: userId, 
-                amt: Math.abs(amt) 
-            });
+            const currentBalance = await this.getPaperFunds(userId);
+            const newBalance = currentBalance + Math.abs(amt);
+            const { error } = await supabase
+                .from('paper_funds')
+                .update({ balance: newBalance })
+                .eq('user_id', userId);
             if (error) throw error;
 
-            const newBalance = await this.getPaperFunds(userId);
             await this.logWalletAction(userId, amt, 'CREDIT', reason, newBalance, tradeId);
             return newBalance;
         } catch (e) {

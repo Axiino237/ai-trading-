@@ -111,6 +111,14 @@ class TechnicalAnalysis {
      * Final Rule Check - Dual Mode
      */
     checkRules(data, mode = 'STRICT') {
+        if (mode === 'OFF') {
+            return {
+                pass: false,
+                side: 'NONE',
+                details: { isBuy: false, isSell: false, logic: 'OFF' }
+            };
+        }
+
         const { ema9, ema20, ema50, rsi, macd, volume, avgVolume, candles } = data;
 
         const lastCandle = candles[candles.length - 1];
@@ -138,20 +146,24 @@ class TechnicalAnalysis {
                 details: { isBuy, isSell }
             };
         } else {
-            // SMART RELAXED MODE - Optimized for Profit/Entry Balance
+            // SMART RELAXED MODE - Tuned for quality breakouts
             const trendUp = ema9 > ema20;
             const trendDown = ema9 < ema20;
 
             // Check MACD Momentum (Directional)
-            const macdBullish = macd.histogram > 0;
-            const macdBearish = macd.histogram < 0;
+            const macdBullish = macd.histogram > 0 && macd.macd > macd.signal;
+            const macdBearish = macd.histogram < 0 && macd.macd < macd.signal;
 
-            const volOk = volume > 1.1 * avgVolume;
-            const rsiOk = rsi > 45 && rsi < 75; // Slightly tighter for better quality
+            // Volume must be at least 25% higher than average for a valid entry signal
+            const volOk = volume > 1.25 * avgVolume;
+            
+            // Tighter RSI to avoid entering at the absolute top/bottom
+            const rsiOkBullish = rsi > 50 && rsi < 68; 
+            const rsiOkBearish = rsi < 50 && rsi > 32;
 
-            // Entry logic: Basic trend + (Either high volume OR a strong candle pattern) + MACD direction
-            const isBuy = trendUp && rsiOk && (volOk || bullishPattern) && macdBullish;
-            const isSell = trendDown && (rsi < 55 && rsi > 25) && (volOk || bearishPattern) && macdBearish;
+            // Entry logic: Basic trend + volume + momentum + strict RSI
+            const isBuy = trendUp && rsiOkBullish && (volOk || bullishPattern) && macdBullish;
+            const isSell = trendDown && rsiOkBearish && (volOk || bearishPattern) && macdBearish;
 
             return {
                 pass: isBuy || isSell,

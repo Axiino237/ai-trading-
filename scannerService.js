@@ -50,6 +50,11 @@ class ScannerService {
 
     startBroadcaster() {
         const run = async () => {
+            if (!this.isMarketOpen()) {
+                setTimeout(run, this.broadcasterInterval);
+                return;
+            }
+
             try {
                 const defaultSymbols = ['RELIANCE-EQ', 'TATASTEEL-EQ', 'SBIN-EQ', 'HDFCBANK-EQ', 'INFY-EQ'];
                 
@@ -120,8 +125,29 @@ class ScannerService {
             const quotesMap = new Map();
             (quotesArray || []).forEach(q => quotesMap.set(q.tradingSymbol, q));
 
-            // 3. CACHE FOR INDICATORS (Computed once per symbol per scan)
+            // 3. PRE-FETCH INDICATORS FOR ALL UNIQUE SYMBOLS (Throttled to 3 req/sec)
             const indicatorCache = new Map();
+            
+            for (const sym of uniqueSymbols) {
+                const quote = quotesMap.get(sym);
+                if (!quote) continue;
+
+                const candles = await angelOneService.getCandleData(sym, 'FIVE_MINUTE', 5);
+                if (candles && candles.length > 0) {
+                    indicatorCache.set(sym, {
+                        ema9: ta.calculateEMA(candles, 9),
+                        ema20: ta.calculateEMA(candles, 20),
+                        ema50: ta.calculateEMA(candles, 50),
+                        rsi: ta.calculateRSI(candles),
+                        macd: ta.calculateMACD(candles),
+                        volume: quote.volume || candles[candles.length - 1][5],
+                        avgVolume: ta.calculateAvgVolume(candles, 20),
+                        candles: candles
+                    });
+                }
+                // Strict 350ms delay between fetches to respect Angel One limit (3 req/sec max)
+                await new Promise(r => setTimeout(r, 350));
+            }
 
             // 4. PROCESS EACH USER INDIVIDUALLY (Personal Risk Logic)
             for (const user of users) {
@@ -143,34 +169,12 @@ class ScannerService {
                 const symbols = userWatchlists[userId] || [];
                 for (const sym of symbols) {
                     const quote = quotesMap.get(sym);
-                    if (!quote) continue;
-
-                    // Fetch or compute indicators (using cache)
-                    let indicators = indicatorCache.get(sym);
-                    if (!indicators) {
-                        const candles = await angelOneService.getCandleData(sym, 'FIVE_MINUTE', 5);
-                        if (candles && candles.length > 0) {
-                            indicators = {
-                                ema9: ta.calculateEMA(candles, 9),
-                                ema20: ta.calculateEMA(candles, 20),
-                                ema50: ta.calculateEMA(candles, 50),
-                                rsi: ta.calculateRSI(candles),
-                                macd: ta.calculateMACD(candles),
-                                volume: quote.volume || candles[candles.length - 1][5],
-                                avgVolume: ta.calculateAvgVolume(candles, 20),
-                                candles: candles
-                            };
-                            indicatorCache.set(sym, indicators);
-                        }
-                    }
-
-                    if (indicators) {
+                    const indicators = indicatorCache.get(sym);
+                    
+                    if (quote && indicators) {
                         // Pass quote and indicators to processEnterpriseFlow
                         await this.processEnterpriseFlow(sym, userId, quote, indicators);
                     }
-                    
-                    // Small delay to prevent CPU spikes
-                    await new Promise(r => setTimeout(r, 200));
                 }
             }
         } catch (error) {
@@ -328,16 +332,34 @@ class ScannerService {
     async getAIAnalysis({ symbol, price, indicators, smartMode = false }) {
         const trend = indicators.ema9 > indicators.ema50 ? 'BULLISH' : 'BEARISH';
         
-        // ELITE PROMPT (Only for Smart Mode)
         if (smartMode) {
+            // Find recent support/resistance from the last 5 candles for better SL/TP placement
+            const recentLows = indicators.candles.slice(-5).map(c => c[3]);
+            const recentHighs = indicators.candles.slice(-5).map(c => c[2]);
+            const localSupport = Math.min(...recentLows);
+            const localResistance = Math.max(...recentHighs);
+
             const candleSummary = indicators.candles.slice(-5).map(c => `[O:${c[1]}, H:${c[2]}, L:${c[3]}, C:${c[4]}, V:${c[5]}]`).join(' | ');
             const elitePrompt = `
-                You are an Elite Institutional Algorithmic Trader. Identify high-probability setups.
-                SYMBOL: ${symbol} @ ₹${price}
-                EMA Trend: ${trend} | RSI: ${indicators.rsi.toFixed(2)} | MACD: ${indicators.macd.histogram.toFixed(2)}
-                LAST 5 CANDLES: ${candleSummary}
-                RULES: BUY if Price>EMA9, MACD increasing, RSI 40-70. SELL if Price<EMA9, MACD decreasing, RSI 30-60.
-                OUTPUT JSON: {"sentiment": "BUY"|"SELL"|"NEUTRAL", "confidenceScore": 0-100, "reasoning": "...", "sl": price, "tp": price, "holdingType": "SHORT_TERM"}
+                Act as an Elite Institutional Algorithmic Trader. Your goal is Capital Preservation and High Win-Rate.
+                Analyze the following setup for ${symbol} @ ₹${price}.
+                
+                TECHNICALS:
+                - Trend: ${trend} (EMA9 vs EMA50)
+                - RSI (14): ${indicators.rsi.toFixed(2)}
+                - MACD Histogram: ${indicators.macd.histogram.toFixed(2)}
+                - Recent Support: ₹${localSupport} | Recent Resistance: ₹${localResistance}
+                
+                LAST 5 CANDLES (Time, Open, High, Low, Close, Volume): 
+                ${candleSummary}
+                
+                RULES:
+                1. REJECT (return NEUTRAL) if there are long wicks indicating rejection, high volatility, or weak momentum.
+                2. If the setup is high quality, determine the optimal holdingType ("INTRADAY" for quick scalps, "SWING" for 1-3 day momentum, or "LONG_TERM" for strong trends).
+                3. Calculate logical Stop Loss (sl) and Take Profit (tp) based on the recent Support/Resistance and price action. DO NOT use arbitrary percentages. Risk/Reward must be at least 1:2.
+                
+                OUTPUT strictly in JSON: 
+                {"sentiment": "BUY"|"SELL"|"NEUTRAL", "confidenceScore": 0-100, "reasoning": "Explain why...", "sl": number, "tp": number, "holdingType": "INTRADAY"|"SWING"|"LONG_TERM"}
             `;
             return await this.executeAI(elitePrompt, price);
         }
@@ -347,7 +369,7 @@ class ScannerService {
             Analyze ${symbol} at ₹${price}. 
             Trend: ${trend}, RSI: ${indicators.rsi.toFixed(2)}, MACD: ${indicators.macd.histogram.toFixed(2)}.
             Suggest BUY, SELL, or NEUTRAL.
-            OUTPUT JSON: {"sentiment": "BUY"|"SELL"|"NEUTRAL", "confidenceScore": 0-100, "reasoning": "...", "holdingType": "SHORT_TERM"}
+            OUTPUT JSON: {"sentiment": "BUY"|"SELL"|"NEUTRAL", "confidenceScore": 0-100, "reasoning": "...", "holdingType": "INTRADAY"}
         `;
         return await this.executeAI(standardPrompt, price);
     }
