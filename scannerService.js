@@ -18,13 +18,17 @@ class ScannerService {
 
     isMarketOpen() {
         const now = new Date();
-        const day = now.getDay();
-        const time = now.getHours().toString().padStart(2, '0') + ":" + now.getMinutes().toString().padStart(2, '0');
+        
+        // Convert to Indian Standard Time (IST) explicitly as servers run in UTC
+        const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: false }); // e.g. "11:47:37"
+        const dayOfWeek = now.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }); // e.g. "Mon"
 
         // Monday to Friday only
-        if (day === 0 || day === 6) return false;
+        if (dayOfWeek === 'Sat' || dayOfWeek === 'Sun') return false;
         
-        // Between 9:15 and 15:30
+        const time = timeStr.substring(0, 5); // gets "HH:MM"
+        
+        // Between 09:15 and 15:30 IST
         return time >= this.marketOpenTime && time <= this.marketCloseTime;
     }
 
